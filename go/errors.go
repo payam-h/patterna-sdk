@@ -31,6 +31,9 @@ const (
 //	unknown_item     404  a catalog call named an item that does not exist
 //	pii_rejected     422  returned, never a fallback: the request carried personal data
 //	mode_conflict    422  returned, never a fallback: the consent mode contradicts the stored one
+//	mode_required    422  SetUserProfile without Mode for a user Patterna has no row for: a profile
+//	                      never creates consent; set the mode first (SetUserMode) or in the profile
+//	not_shown        409  Abandon named a slate answered shown=false: hide the block, never abandon
 const (
 	CodeNoCandidates   = "no_candidates"
 	CodeSurfaceOff     = "surface_off"
@@ -39,6 +42,8 @@ const (
 	CodeUnknownItem    = "unknown_item"
 	CodePIIRejected    = "pii_rejected"
 	CodeModeConflict   = "mode_conflict"
+	CodeModeRequired   = "mode_required"
+	CodeNotShown       = "not_shown"
 )
 
 // Error is every error the client returns.
@@ -75,6 +80,8 @@ var (
 	ErrUnknownItem    = &Error{Code: CodeUnknownItem}
 	ErrPIIRejected    = &Error{Code: CodePIIRejected}
 	ErrModeConflict   = &Error{Code: CodeModeConflict}
+	ErrModeRequired   = &Error{Code: CodeModeRequired}
+	ErrNotShown       = &Error{Code: CodeNotShown}
 )
 
 func (e *Error) Error() string {
@@ -136,7 +143,7 @@ func isCallerBug(err error) bool {
 	}
 	switch pe.Code {
 	case CodeConsentRequired, CodeConsentViolation, CodeInvalidArgument, CodeNotConfigured,
-		CodePIIRejected, CodeModeConflict:
+		CodePIIRejected, CodeModeConflict, CodeModeRequired:
 		return true
 	}
 	return false

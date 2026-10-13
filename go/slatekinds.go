@@ -5,36 +5,43 @@ import "sync"
 const defaultSlateMemory = 4096
 
 // slateKinds remembers, for the most recent slates, which items are not documents, so
-// ReportInteractions can refuse an interaction without Kind before it is sent. Bounded FIFO.
+// ReportInteractions can refuse an interaction without Kind before it is sent, and which slates
+// were answered shown=false, so Abandon refuses them (the engine would answer 409 not_shown).
+// Bounded FIFO.
 type slateKinds struct {
 	mu    sync.Mutex
 	limit int
-	m     map[string]map[string]string // request id -> item id -> kind (non-documents only)
+	m     map[string]slateMemo
 	order []string
 	next  int
+}
+
+type slateMemo struct {
+	kinds    map[string]string // item id -> kind (non-documents only)
+	notShown bool
 }
 
 func newSlateKinds(limit int) *slateKinds {
 	if limit < 0 {
 		return nil
 	}
-	return &slateKinds{limit: limit, m: make(map[string]map[string]string, limit), order: make([]string, limit)}
+	return &slateKinds{limit: limit, m: make(map[string]slateMemo, limit), order: make([]string, limit)}
 }
 
 func (s *slateKinds) remember(sl *Slate) {
 	if s == nil || sl == nil || sl.RequestID == "" {
 		return
 	}
-	var kinds map[string]string
+	memo := slateMemo{notShown: !sl.Visible()}
 	for _, it := range sl.Items {
 		if it.Kind != "" && it.Kind != string(KindDocument) {
-			if kinds == nil {
-				kinds = map[string]string{}
+			if memo.kinds == nil {
+				memo.kinds = map[string]string{}
 			}
-			kinds[it.ItemID] = it.Kind
+			memo.kinds[it.ItemID] = it.Kind
 		}
 	}
-	if kinds == nil {
+	if memo.kinds == nil && !memo.notShown {
 		return
 	}
 	s.mu.Lock()
@@ -46,7 +53,7 @@ func (s *slateKinds) remember(sl *Slate) {
 		s.order[s.next] = sl.RequestID
 		s.next = (s.next + 1) % s.limit
 	}
-	s.m[sl.RequestID] = kinds
+	s.m[sl.RequestID] = memo
 }
 
 func (s *slateKinds) kind(requestID, itemID string) string {
@@ -55,5 +62,15 @@ func (s *slateKinds) kind(requestID, itemID string) string {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.m[requestID][itemID]
+	return s.m[requestID].kinds[itemID]
+}
+
+// notShown reports whether this client received requestID as a shown=false answer.
+func (s *slateKinds) notShown(requestID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m[requestID].notShown
 }

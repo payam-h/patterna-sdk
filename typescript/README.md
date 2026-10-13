@@ -1,15 +1,17 @@
 # patterna-sdk
 
-Version 0.2.0 (see `CHANGELOG.md`). Needs engine 0.2 or later, which is the engine in production.
+Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (control lists,
+`shown: false`, fills, coach events, the new admin calls) need engine 0.3 (`engine_version`
+0.2.0), which is the engine in production.
 
 **Install.** The npm name is `patterna-sdk`, and it is not published yet: `npm install
 patterna-sdk` returns 404 today. Until it is, build it from the public repository
-[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.2.0`:
+[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.3.0`:
 
 ```sh
-git clone --branch v0.2.0 https://github.com/payam-h/patterna-sdk.git
-cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.2.0.tgz
-cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.2.0.tgz
+git clone --branch v0.3.0 https://github.com/payam-h/patterna-sdk.git
+cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.3.0.tgz
+cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.3.0.tgz
 ```
 
 In this monorepo the package is `@patterna/sdk` (private); the release script renames it.
@@ -102,6 +104,51 @@ else { render(r.value); log.info({ request_id: r.requestId, code: r.error.code, 
 Call `patterna.abandon(requestId)` yourself when a slate arrived but the app showed something
 else.
 
+### `shown: false`: hide the block (engine 0.3)
+
+When fewer items than the surface's `min_slots` pass the request's rules, the engine answers
+`shown: false` with no items. That slate already counts in its arm with zero taps, so it is never
+abandoned and never replaced by your list. Every result carries `shown`:
+
+```ts
+const r = await patterna.recommendWithFallback(req, () => newestArticleIds());
+if (!r.shown) hideBlock();                       // source "patterna", no items, nothing abandoned
+else render(r.source === "patterna" ? r.value.items : r.value);
+```
+
+`abandon(requestId)` on such a slate rejects with `not_shown` without sending when this client
+served it; otherwise the engine answers 409 `not_shown`. `withFallback` results carry `shown` too.
+
+### Control lists, communities and fills (engine 0.3)
+
+- `context.control_item_ids` (at most 50): your own editorial list for this page (the
+  article's "pairs with" products). In the control arm it is the slate, in this order
+  (`control_source: "request"`); in treatment it is what short slates are filled from. Without
+  it the control slate comes from the surface's `fallback.by_anchor` for the anchor
+  (`"by_anchor"`) or its own list (`"surface"`).
+- `context.member_of` (at most 500): community ids the user is in, never offered. Meant for
+  `non_profiled` requests, which have no identity to look membership up by.
+- `fill_count` on the slate: trailing slots filled from the editorial list because the ranked
+  candidates ran out. The SDK marks those items `fill: true` (`markFills`).
+- `model_versions` is typed on `Slate`; engine 0.3 logs it on the impression (trace, export)
+  and does not send it with the answer yet.
+
+### AI coach products (engine 0.3)
+
+```ts
+import { coachProductShown, coachProductTapped } from "patterna-sdk";
+
+await patterna.ingestEvents([
+  coachProductShown({ mode, userId, productId: "p_mag", conversationId, position: 0 }),
+]);
+// non_profiled: { mode: "non_profiled", sessionId, ... } and no userId
+```
+
+`product_id` is the catalog `external_id`, `conversation_id` your own opaque id (never message
+text), `position` the 0-based place among the answer's products. The helpers apply the consent
+rules (user id in personalized and cohort, session id only in non_profiled) and default
+`event_id`, `occurred_at` and `source: "backend"`.
+
 ### Several surfaces in one call
 
 `recommendMany([{ request, fallback }, ...])` runs the requests in parallel; each has the same
@@ -160,6 +207,22 @@ For CI scripts that keep flow configs in your repository: `listSurfaces`, `getSu
 `applyFlow` compares configs as canonical JSON: nothing happens when the active version
 matches. The Go SDK ships the same as a CLI (`packages/sdk-go/cmd/patterna`).
 
+Engine 0.3:
+
+- `applySurface(spec)` / `planSurface(spec)` / `updateSurface(key, spec)` with a `SurfaceSpec`
+  (`slots`, `item_kinds`, `fallback: { kind, item_ids, by_anchor }`, `min_slots`,
+  `device_resort`, `notes`, `exploration_share`). `applySurface` patches only the fields that
+  differ and returns `{ changes, applied }`; the fallback is replaced as a whole.
+  `validateSurfaceSpec` runs the engine's checks before anything is sent. The engine answers a
+  surface PATCH with `{ key, ok }`, so these calls (and `setSurfaceStatus`, `setSurfaceTesters`)
+  read the surface back.
+- `ledgerByBlock(q)` (`by=block`): one row per surface and block; `ledger({ block })` one block.
+- `surfaceMetrics(key, { days, block })`: daily rows with `not_shown_share` and
+  `client_abandoned_rate`.
+- `getSettings()`, `updateSettings(patch)`, `setPhaseTags(on)` (`phase_fit` in slates; off by
+  default).
+- `health()`: `{ status, version, engine_version, ... }`.
+
 ### Errors
 
 Every failure is a `PatternaError` with `code`, `op`, `status`, `requestId`, `details` and a
@@ -174,6 +237,8 @@ Every failure is a `PatternaError` with `code`, `op`, `status`, `requestId`, `de
 | `surface_off` | 409 | fallback (the kill switch) |
 | `unknown_surface` | 404 | fallback, but a configuration bug: alert on it |
 | `mode_conflict` | 422 | rethrown |
+| `mode_required` | 422 | rethrown; `setUserProfile` without `mode` for a user Patterna has no row for |
+| `not_shown` | 409 | `abandon` on a `shown: false` slate: hide the block instead |
 | `pii_rejected` | 422 | rethrown |
 | `unknown_request` | 404 | `abandon`, `reportInteractions` |
 | `unknown_item` | 404 | catalog calls |
@@ -211,7 +276,7 @@ const ids = r.source === "patterna" ? r.value.items.map((i) => i.item_id) : r.va
 ```
 
 By default it falls back on any SDK error except `ConsentError`, `ValidationError`,
-`pii_rejected` and `mode_conflict`, which are bugs in the caller (a consent bug is a privacy bug)
+`pii_rejected`, `mode_conflict` and `mode_required`, which are bugs in the caller (a consent bug is a privacy bug)
 and are rethrown. Prefer `client.recommendWithFallback`, which also reports abandoned slates. `{ on: "timeout" }`
 narrows it to timeouts. Report interactions only when `r.source === "patterna"`.
 
@@ -336,23 +401,20 @@ abandonment, the server deadline header, trace ids, typed errors with the API co
 id, per-call timeouts (150 ms / 5 s / 30 s), one retry for idempotent calls, the consent gate in types and at
 runtime, opaque-user-id checks, `withFallback`, `EventQueue` (bounded, persistent via an injected
 AsyncStorage-shaped store, consent-aware, idempotent restore), HMAC signing with a cross-language
-vector, assignment units, session ids. 95 tests with mocked fetch. ESM + CJS + d.ts via tsup.
-
-The request and slate types come from the contract (`src/generated/types.ts`, API 0.2.0), so
-`context.control_item_ids` (the caller's own editorial list, the control slate for this page),
-`context.member_of` (communities to exclude) and the answer's `control_source` and `fill_count`
-are typed. A `shown: false` answer is a normal 200 and is never abandoned: the SDK abandons only
-after a timeout, a network error or a 5xx.
+vector, assignment units, session ids, and engine 0.3: control lists, `member_of`,
+`control_source`, fills, `shown` on every result, `mode_required` and `not_shown`, coach product
+events, surface apply, block ledger rows, surface metrics, phase tags and health. 113 tests with
+mocked fetch and a small in-memory engine. ESM + CJS + d.ts via tsup.
 
 Deliberately left out:
 
-- Admin endpoints beyond surfaces, flows, experiments, ledger and the signing secret (keys,
-  curation, settings): the panel owns them.
+- Admin endpoints beyond surfaces, flows, experiments, ledger, metrics, phase tags and the
+  signing secret (keys, curation, the other settings): the panel owns them.
 - A circuit breaker: backends that need one use `packages/sdk-go`; in an app `withFallback` and
   the per-call budget are enough.
 - No persistent queue for abandonments: they are fire-and-forget promises. In a backend that
   shuts down, a few may be lost; the Go SDK drains its queue on `Close`.
-- Not on npm yet: publishing `patterna-sdk` 0.2.0 is pending. Build it from the public
+- Not on npm yet: publishing `patterna-sdk` 0.3.0 is pending. Build it from the public
   repository as shown at the top.
 
 Settled since 0.1: the user endpoints (`/users/{id}/mode`, `/users/{id}/profile`,

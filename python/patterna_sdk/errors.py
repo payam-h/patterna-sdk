@@ -60,6 +60,10 @@ class ApiErrorCode:
     unknown_item (404)     catalog calls
     pii_rejected (422)     re-raised: personal data in the request
     mode_conflict (422)    re-raised: the consent mode contradicts the stored one
+    mode_required (422)    set_user_profile without a mode for a user Patterna has no row for: a
+                           profile never creates consent; set the mode first (engine 0.3)
+    not_shown (409)        abandon named a slate answered shown=false: hide the block, never
+                           abandon it (engine 0.3)
     """
 
     NO_CANDIDATES = "no_candidates"
@@ -69,6 +73,8 @@ class ApiErrorCode:
     UNKNOWN_ITEM = "unknown_item"
     PII_REJECTED = "pii_rejected"
     MODE_CONFLICT = "mode_conflict"
+    MODE_REQUIRED = "mode_required"
+    NOT_SHOWN = "not_shown"
 
 
 def is_api_error(err: BaseException, code: str) -> bool:
@@ -77,7 +83,8 @@ def is_api_error(err: BaseException, code: str) -> bool:
 
 
 def is_caller_bug(err: BaseException) -> bool:
-    """Errors no fallback may hide: consent and input bugs, pii_rejected and mode_conflict."""
+    """Errors no fallback may hide: consent and input bugs, pii_rejected, mode_conflict, mode_required."""
     return isinstance(err, (ConsentError, ValidationError)) or (
-        isinstance(err, ApiError) and err.code in (ApiErrorCode.PII_REJECTED, ApiErrorCode.MODE_CONFLICT)
+        isinstance(err, ApiError)
+        and err.code in (ApiErrorCode.PII_REJECTED, ApiErrorCode.MODE_CONFLICT, ApiErrorCode.MODE_REQUIRED)
     )

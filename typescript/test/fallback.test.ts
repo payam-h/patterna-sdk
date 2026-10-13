@@ -13,7 +13,7 @@ describe("withFallback", () => {
   it("returns the slate when Patterna answers", async () => {
     const m = mockFetch({ status: 200, body: slate });
     const r = await withFallback(() => client(m.fetch).recommend(req), mine);
-    expect(r).toEqual({ source: "patterna", value: slate });
+    expect(r).toEqual({ source: "patterna", value: slate, shown: true });
   });
 
   it("returns the customer's own list when the 150 ms budget runs out", async () => {

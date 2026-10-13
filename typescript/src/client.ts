@@ -1,5 +1,5 @@
 import { assertIdentityAllowed, assertMode, assertOpaqueUserId } from "./consent.js";
-import { ApiError, ErrorCode, isCallerBug, PatternaError, ValidationError } from "./errors.js";
+import { ApiError, ApiErrorCode, ErrorCode, isCallerBug, PatternaError, ValidationError } from "./errors.js";
 import { newRequestId, Transport, type FetchLike, type RequestSpec } from "./http.js";
 import { canonicalJson } from "./signing.js";
 import type {
@@ -13,6 +13,7 @@ import type {
   ExportJob,
   Flow,
   FlowConfig,
+  Health,
   IngestEventsResult,
   Interaction,
   InteractionType,
@@ -25,12 +26,19 @@ import type {
   LedgerRow,
   LedgerWeek,
   ListItemsParams,
+  MetricsDay,
+  MetricsQuery,
   Mode,
   RecommendRequest,
   SetItemStatusBody,
+  Settings,
+  SettingsPatch,
   SigningSecret,
   Slate,
   Surface,
+  SurfaceFallback,
+  SurfacePlan,
+  SurfaceSpec,
   SurfaceStatus,
   UpsertItemsResult,
   UserProfile,
@@ -54,6 +62,10 @@ const MAX_INTERACTIONS = 50;
 const MAX_EVENTS = 500;
 const MAX_ITEMS = 500;
 const MAX_EXCLUDES = 200;
+const MAX_CONTROL_ITEMS = 50;
+const MAX_MEMBER_OF = 500;
+const MAX_LEDGER_BLOCK = 32;
+const FALLBACK_KINDS = new Set(["newest", "popular", "curated"]);
 const EVENT_CONTEXT_KEYS = new Set(["locale", "app_version", "platform", "hour_bucket"]);
 
 export interface PatternaClientOptions {
@@ -92,12 +104,18 @@ export interface ManyRequest<F = string[]> {
   fallback: () => F | Promise<F>;
 }
 
-/** What {@link PatternaClient.recommendWithFallback} returns. */
+/**
+ * What {@link PatternaClient.recommendWithFallback} returns. `shown` (engine 0.3) says whether to
+ * render the block: false only for a slate answered `shown: false` (fewer eligible items than the
+ * surface's min_slots), which carries no items, is not replaced by the fallback and is never
+ * abandoned. Hide the block. True for every other answer, the fallback included.
+ */
 export type Recommendation<F = string[]> =
-  | { source: "patterna"; value: Slate; requestId: string }
+  | { source: "patterna"; value: Slate; requestId: string; shown: boolean }
   | {
       source: "fallback";
       value: F;
+      shown: true;
       /** The id sent as X-Request-Id, so you can log it even though no slate came back. */
       requestId: string;
       error: PatternaError;
@@ -113,8 +131,11 @@ export class PatternaClient {
   private readonly adminMs: number;
   private readonly onBackgroundError: ((error: PatternaError) => void) | undefined;
   private readonly slateMemory: number;
-  /** request id -> item id -> kind, non-documents only; insertion-ordered for eviction. */
-  private readonly kinds = new Map<string, Map<string, string>>();
+  /**
+   * request id -> non-document kinds per item, and whether the slate was answered shown=false;
+   * insertion-ordered for eviction.
+   */
+  private readonly kinds = new Map<string, { kinds: Map<string, string>; notShown: boolean }>();
 
   constructor(opts: PatternaClientOptions) {
     if (!opts.baseUrl) throw new TypeError("PatternaClient: baseUrl is required");
@@ -166,6 +187,12 @@ export class PatternaClient {
     if ((req.exclude_item_ids?.length ?? 0) > MAX_EXCLUDES) {
       invalid(op, `exclude_item_ids is limited to ${MAX_EXCLUDES}`);
     }
+    if ((req.context.control_item_ids?.length ?? 0) > MAX_CONTROL_ITEMS) {
+      invalid(op, `context.control_item_ids is limited to ${MAX_CONTROL_ITEMS}`);
+    }
+    if ((req.context.member_of?.length ?? 0) > MAX_MEMBER_OF) {
+      invalid(op, `context.member_of is limited to ${MAX_MEMBER_OF}`);
+    }
     if (req.assignment_unit !== undefined && !HMAC_HEX.test(req.assignment_unit)) {
       invalid(op, "assignment_unit must be assignmentUnit(secret, userId): 64 lowercase hex characters, never a raw id");
     }
@@ -185,6 +212,7 @@ export class PatternaClient {
     });
     const slate = res.data;
     if (slate && !slate.request_id) slate.request_id = res.requestId ?? requestId;
+    if (slate) markFills(slate);
     this.rememberKinds(slate);
     return slate;
   }
@@ -193,7 +221,11 @@ export class PatternaClient {
    * `recommend`, or your own list when Patterna cannot answer in time. The request id is minted
    * here, so on a timeout, network error, 5xx or unreadable answer the client reports the
    * abandonment in the background (engine 0.2) and Patterna does not count a slate nobody saw.
-   * Consent and input bugs, `pii_rejected` and `mode_conflict` are rethrown, never hidden.
+   * Consent and input bugs, `pii_rejected`, `mode_conflict` and `mode_required` are rethrown,
+   * never hidden.
+   *
+   * A `shown: false` answer (engine 0.3) is returned as it is: `shown` false, no items, no
+   * fallback, nothing abandoned. Hide the block.
    */
   async recommendWithFallback<F = string[]>(
     req: RecommendRequest,
@@ -203,7 +235,7 @@ export class PatternaClient {
     const requestId = opts.requestId ?? newRequestId();
     try {
       const slate = await this.recommend(req, { ...opts, requestId });
-      return { source: "patterna", value: slate, requestId: slate.request_id };
+      return { source: "patterna", value: slate, requestId: slate.request_id, shown: slate.shown !== false };
     } catch (err) {
       if (!(err instanceof PatternaError) || isCallerBug(err)) throw err;
       const reason = abandonReason(err);
@@ -214,7 +246,7 @@ export class PatternaClient {
           },
         );
       }
-      return { source: "fallback", value: await fallback(), requestId, error: err, abandoned: reason !== undefined };
+      return { source: "fallback", value: await fallback(), shown: true, requestId, error: err, abandoned: reason !== undefined };
     }
   }
 
@@ -235,10 +267,22 @@ export class PatternaClient {
    * `POST /recommendations/{id}/abandon`), so the impression counts as a client fallback.
    * `recommendWithFallback` does it for you; call it when a slate arrived but you showed
    * something else. An id the engine never logged rejects with `unknown_request`.
+   *
+   * A slate answered `shown: false` is never abandoned (it already counts in its arm with zero
+   * taps): when this client served it, this rejects with `not_shown` without sending; otherwise
+   * the engine answers 409 `not_shown`.
    */
   async abandon(requestId: string, reason: AbandonReason = "client_fallback", opts: CallOptions = {}): Promise<void> {
     const op = "abandon";
     if (!requestId) invalid(op, "requestId is required");
+    if (this.kinds.get(requestId)?.notShown) {
+      throw new ValidationError({
+        code: ApiErrorCode.NotShown,
+        op,
+        requestId,
+        message: "the slate was answered shown=false: hide the block, do not abandon it",
+      });
+    }
     await this.http.send<unknown>({
       op,
       method: "POST",
@@ -358,7 +402,11 @@ export class PatternaClient {
     });
   }
 
-  /** Declared attributes as tag affinities. Never health values. */
+  /**
+   * Declared attributes as tag affinities. Never health values. A profile never creates consent
+   * (engine 0.3): without `mode`, a user Patterna has no row for rejects with `mode_required`
+   * (422); set the mode in the profile or call `setUserMode` first.
+   */
   async setUserProfile(userId: string, profile: UserProfile, opts: CallOptions = {}): Promise<void> {
     const op = "setUserProfile";
     assertOpaqueUserId(userId, op);
@@ -513,11 +561,7 @@ export class PatternaClient {
     const op = "setSurfaceStatus";
     if (!key) invalid(op, "surface key is required");
     if (!SURFACE_STATUSES.has(status)) invalid(op, "status must be shadow, testers, live or off");
-    const res = await this.admin<Surface>(
-      { op, method: "PATCH", path: `/surfaces/${encodeURIComponent(key)}`, body: { status }, idempotent: true },
-      opts,
-    );
-    return res.data;
+    return this.patchSurface(op, key, { status }, opts);
   }
 
   /** Replaces the tester roster: at most 200 random user ids, never emails. */
@@ -526,10 +570,101 @@ export class PatternaClient {
     if (!key) invalid(op, "surface key is required");
     if (userIds.length > 200) invalid(op, "at most 200 testers");
     for (const id of userIds) assertOpaqueUserId(id, op);
+    return this.patchSurface(op, key, { testers: userIds }, opts);
+  }
+
+  private async patchSurface(op: string, key: string, body: Record<string, unknown>, opts: CallOptions): Promise<Surface> {
     const res = await this.admin<Surface>(
-      { op, method: "PATCH", path: `/surfaces/${encodeURIComponent(key)}`, body: { testers: userIds }, idempotent: true },
+      { op, method: "PATCH", path: `/surfaces/${encodeURIComponent(key)}`, body, idempotent: true },
       opts,
     );
+    // The engine answers {key, ok} rather than the surface: read it back so callers see its state.
+    if (res.data && typeof res.data === "object" && res.data.status) return res.data;
+    return this.getSurface(key, opts);
+  }
+
+  /**
+   * Engine 0.3: `PATCH /surfaces/{key}` with the fields `spec` sets (slots, item kinds, the
+   * fallback with `by_anchor`, `min_slots`, `device_resort`, notes, exploration share). Returns
+   * the surface after the change. `spec.surface` is ignored.
+   */
+  async updateSurface(key: string, spec: Omit<SurfaceSpec, "surface">, opts: CallOptions = {}): Promise<Surface> {
+    const full = { ...spec, surface: key };
+    validateSurfaceSpec(full, "updateSurface");
+    const body = surfaceBody(full);
+    if (Object.keys(body).length === 0) invalid("updateSurface", "nothing to change");
+    return this.patchSurface("updateSurface", key, body, opts);
+  }
+
+  /** Lists the fields where `spec` differs from the surface as it is. Writes nothing. */
+  async planSurface(spec: SurfaceSpec, opts: CallOptions = {}): Promise<SurfacePlan> {
+    validateSurfaceSpec(spec, "planSurface");
+    const cur = (await this.getSurface(spec.surface, opts)) as Surface & { min_slots?: number; device_resort?: boolean };
+    const changes: string[] = [];
+    const add = (field: string, differs: boolean) => {
+      if (differs) changes.push(field);
+    };
+    add("item_kinds", (spec.item_kinds?.length ?? 0) > 0 && !sameSet(spec.item_kinds ?? [], cur.item_kinds ?? []));
+    add("slots", spec.slots !== undefined && spec.slots !== cur.slots);
+    add("fallback", spec.fallback !== undefined && !sameFallback(spec.fallback, cur.fallback as SurfaceFallback | undefined));
+    add("min_slots", spec.min_slots !== undefined && spec.min_slots !== (cur.min_slots ?? 0));
+    add("device_resort", spec.device_resort !== undefined && spec.device_resort !== (cur.device_resort ?? false));
+    add("notes", spec.notes !== undefined && spec.notes !== (cur.notes ?? ""));
+    add("exploration_share", spec.exploration_share !== undefined && spec.exploration_share !== cur.exploration_share);
+    return { surface: spec.surface, changes, applied: false };
+  }
+
+  /**
+   * Makes the surface match `spec` (`patterna surface apply` in CI): patches only the fields that
+   * differ, nothing when none do. The fallback is replaced as a whole, so keep the full list in
+   * the file.
+   */
+  async applySurface(spec: SurfaceSpec, opts: CallOptions = {}): Promise<SurfacePlan> {
+    const plan = await this.planSurface(spec, opts);
+    if (plan.changes.length === 0) return plan;
+    const all = surfaceBody(spec);
+    const body: Record<string, unknown> = {};
+    for (const f of plan.changes) body[f] = all[f];
+    await this.patchSurface("applySurface", spec.surface, body, opts);
+    return { ...plan, applied: true };
+  }
+
+  /** Engine 0.3: a surface's daily metrics (UTC days, zero-filled), with `not_shown_share` and `client_abandoned_rate`. */
+  async surfaceMetrics(key: string, q: MetricsQuery = {}, opts: CallOptions = {}): Promise<MetricsDay[]> {
+    const op = "surfaceMetrics";
+    if (!key) invalid(op, "surface key is required");
+    if (q.days !== undefined && (!Number.isInteger(q.days) || q.days < 1 || q.days > 180)) invalid(op, "days must be 1 to 180");
+    checkBlock(op, q.block);
+    const query: Record<string, string> = {};
+    if (q.days !== undefined) query.days = String(q.days);
+    if (q.block) query.block = q.block;
+    const res = await this.admin<{ days?: MetricsDay[] }>(
+      { op, method: "GET", path: `/surfaces/${encodeURIComponent(key)}/metrics`, query, idempotent: true },
+      opts,
+    );
+    return res.data?.days ?? [];
+  }
+
+  /** Tenant settings; `phase_tags` (engine 0.3) says whether slates carry phase_fit. */
+  async getSettings(opts: CallOptions = {}): Promise<Settings> {
+    const res = await this.admin<Settings>({ op: "getSettings", method: "GET", path: "/settings", idempotent: true }, opts);
+    return res.data ?? {};
+  }
+
+  /** `PATCH /settings` (owners and admin keys). */
+  async updateSettings(patch: SettingsPatch, opts: CallOptions = {}): Promise<void> {
+    if (Object.keys(patch).length === 0) invalid("updateSettings", "nothing to change");
+    await this.admin<unknown>({ op: "updateSettings", method: "PATCH", path: "/settings", body: patch, idempotent: true }, opts);
+  }
+
+  /** Engine 0.3: turns phase_fit item metadata on or off for the tenant (off by default). */
+  async setPhaseTags(on: boolean, opts: CallOptions = {}): Promise<void> {
+    await this.updateSettings({ phase_tags: on }, opts);
+  }
+
+  /** `GET /health`: liveness, the release and (engine 0.3) `engine_version`. */
+  async health(opts: CallOptions = {}): Promise<Health> {
+    const res = await this.admin<Health>({ op: "health", method: "GET", path: "/health", idempotent: true }, opts);
     return res.data;
   }
 
@@ -655,10 +790,26 @@ export class PatternaClient {
     );
   }
 
-  /** One summary row per surface with the user-clustered interval. */
+  /** One summary row per surface with the user-clustered interval (one block's rows with `q.block`). */
   async ledger(q: LedgerQuery = {}, opts: CallOptions = {}): Promise<LedgerRow[]> {
+    checkBlock("ledger", q.block);
     const res = await this.admin<LedgerRow[]>(
       { op: "ledger", method: "GET", path: "/proof/ledger", query: ledgerQuery(q), idempotent: true },
+      opts,
+    );
+    return list(res.data, res.status);
+  }
+
+  /**
+   * Engine 0.3 (`by=block`): one row per surface and block, over the slates the client reported
+   * seen in that block and the taps in it. Descriptive; the whole-slate row decides. `q.block` is
+   * ignored.
+   */
+  async ledgerByBlock(q: LedgerQuery = {}, opts: CallOptions = {}): Promise<LedgerRow[]> {
+    const { block: _ignored, ...rest } = q;
+    void _ignored;
+    const res = await this.admin<LedgerRow[]>(
+      { op: "ledgerByBlock", method: "GET", path: "/proof/ledger", query: { ...ledgerQuery(rest), by: "block" }, idempotent: true },
       opts,
     );
     return list(res.data, res.status);
@@ -704,9 +855,10 @@ export class PatternaClient {
     if (!slate?.request_id || this.slateMemory === 0) return;
     const m = new Map<string, string>();
     for (const it of slate.items ?? []) if (it.kind && it.kind !== "document") m.set(it.item_id, it.kind);
-    if (m.size === 0) return;
+    const notShown = slate.shown === false;
+    if (m.size === 0 && !notShown) return;
     this.kinds.delete(slate.request_id);
-    this.kinds.set(slate.request_id, m);
+    this.kinds.set(slate.request_id, { kinds: m, notShown });
     while (this.kinds.size > this.slateMemory) {
       const oldest = this.kinds.keys().next().value as string;
       this.kinds.delete(oldest);
@@ -723,7 +875,7 @@ export class PatternaClient {
       if (!ITEM_KINDS.has(it.kind)) invalid(op, `interaction ${i}: unknown kind "${it.kind}"`);
       return;
     }
-    const k = this.kinds.get(requestId)?.get(it.item_id);
+    const k = this.kinds.get(requestId)?.kinds.get(it.item_id);
     if (k) invalid(op, `interaction ${i}: kind is required for ${k} items (only documents may leave it empty)`);
   }
 
@@ -783,7 +935,74 @@ function ledgerQuery(q: LedgerQuery): Record<string, string> {
   if (q.surface) out.surface = q.surface;
   if (q.from) out.from = q.from;
   if (q.to) out.to = q.to;
+  if (q.block) out.block = q.block;
   return out;
+}
+
+function checkBlock(op: string, block: string | undefined): void {
+  if (block !== undefined && block.length > MAX_LEDGER_BLOCK) invalid(op, `block is a short name of at most ${MAX_LEDGER_BLOCK} characters`);
+}
+
+/**
+ * Marks the trailing `fill_count` items `fill: true` when the engine did not mark any slot itself
+ * (engine 0.3 sends `fill_count` on the slate and `fill` per slot only in its log).
+ */
+export function markFills(slate: Slate): Slate {
+  const n = slate.fill_count ?? 0;
+  const items = slate.items ?? [];
+  if (n <= 0 || items.some((it) => it.fill)) return slate;
+  for (let i = Math.max(0, items.length - n); i < items.length; i++) (items[i] as { fill?: boolean }).fill = true;
+  return slate;
+}
+
+/** Checks a surface spec the way the engine will, so a CI run fails before anything is sent. */
+export function validateSurfaceSpec(s: SurfaceSpec, op = "applySurface"): void {
+  if (!s.surface) invalid(op, "surface key is required");
+  if (s.slots !== undefined && (!Number.isInteger(s.slots) || s.slots < 1 || s.slots > 50)) invalid(op, "slots must be 1 to 50");
+  if (s.min_slots !== undefined && (!Number.isInteger(s.min_slots) || s.min_slots < 0 || s.min_slots > 50)) {
+    invalid(op, "min_slots must be 0 to 50");
+  }
+  if (s.exploration_share !== undefined && (s.exploration_share < 0 || s.exploration_share > 1)) {
+    invalid(op, "exploration_share must be 0 to 1");
+  }
+  if (s.notes !== undefined && s.notes.length > 4000) invalid(op, "notes holds at most 4000 characters");
+  for (const k of s.item_kinds ?? []) if (!ITEM_KINDS.has(k)) invalid(op, `unknown item kind "${k}"`);
+  const f = s.fallback;
+  if (f) {
+    if (!FALLBACK_KINDS.has(f.kind)) invalid(op, "fallback.kind must be newest, popular or curated");
+    if (f.kind === "curated" && (f.item_ids?.length ?? 0) === 0) invalid(op, "a curated fallback needs item_ids");
+    for (const [anchor, ids] of Object.entries(f.by_anchor ?? {})) {
+      if (!anchor || ids.length === 0) invalid(op, "fallback.by_anchor maps an anchor id to a non-empty list");
+    }
+  }
+}
+
+function surfaceBody(s: SurfaceSpec): Record<string, unknown> {
+  const b: Record<string, unknown> = {};
+  if ((s.item_kinds?.length ?? 0) > 0) b.item_kinds = s.item_kinds;
+  if (s.slots !== undefined) b.slots = s.slots;
+  if (s.fallback !== undefined) b.fallback = s.fallback;
+  if (s.min_slots !== undefined) b.min_slots = s.min_slots;
+  if (s.device_resort !== undefined) b.device_resort = s.device_resort;
+  if (s.notes !== undefined) b.notes = s.notes;
+  if (s.exploration_share !== undefined) b.exploration_share = s.exploration_share;
+  return b;
+}
+
+function sameSet(a: string[], b: string[]): boolean {
+  const x = [...new Set(a)].sort();
+  const y = [...new Set(b)].sort();
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+function sameFallback(want: SurfaceFallback, got: SurfaceFallback | undefined): boolean {
+  if (!got) return false;
+  const norm = (f: SurfaceFallback) => ({
+    kind: f.kind,
+    item_ids: f.item_ids?.length ? f.item_ids : undefined,
+    by_anchor: f.by_anchor && Object.keys(f.by_anchor).length ? f.by_anchor : undefined,
+  });
+  return canonicalJson(norm(want)) === canonicalJson(norm(got));
 }
 
 function invalid(op: string, message: string): never {

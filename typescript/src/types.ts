@@ -14,8 +14,24 @@ type JsonResponse<Op, Status extends number> = Op extends {
 
 export type Mode = Schemas["Mode"];
 export type ApiErrorBody = Schemas["Error"];
-export type Slate = Schemas["Slate"];
-export type SlateItem = Schemas["SlateItem"];
+/**
+ * One slot. `fill` (engine 0.3) is true when the slot was filled from the editorial list behind
+ * the ranked items (`Slate.fill_count`); the SDK sets it from `fill_count` when the engine does
+ * not send it per slot.
+ */
+export type SlateItem = Schemas["SlateItem"] & { fill?: boolean };
+/**
+ * A ranked list. Engine 0.3 adds `control_source` (where an editorial slate came from),
+ * `fill_count` (trailing slots filled from the editorial list) and `shown: false` answers with no
+ * items: hide the block and never abandon them. `model_versions` names the model version each
+ * learner read; engine 0.3 logs it on the impression (trace, export) and does not send it with
+ * the answer yet, so it is usually absent.
+ */
+export type Slate = Omit<Schemas["Slate"], "items"> & {
+  items: SlateItem[];
+  model_versions?: Record<string, string>;
+};
+export type ControlSource = NonNullable<Schemas["Slate"]["control_source"]>;
 /**
  * One seen, click or dismiss. `kind` is required for anything that is not a document (engine 0.2
  * refuses it otherwise); `position` is the served 0-based slot; `displayed_position` is where
@@ -39,6 +55,9 @@ export type RecommendRequestBody = Schemas["RecommendRequest"];
  * absent means true. Set it from the user's analytics consent with {@link measuredContext}.
  */
 export type RecommendContext = RecommendRequestBody["context"] & { measured?: boolean };
+// control_item_ids (at most 50: your own editorial list for this page, the control slate) and
+// member_of (at most 500 community ids the user is in, never offered; for non_profiled) come
+// from the contract (engine 0.3).
 
 type RecommendCommon = Omit<RecommendRequestBody, "mode" | "user_id" | "session_id" | "context"> & {
   context: RecommendContext;
@@ -123,6 +142,67 @@ export interface LedgerQuery {
   /** UTC date, YYYY-MM-DD. */
   from?: string;
   to?: string;
+  /** Engine 0.3: rows for this UI block only (at most 32 characters). For every block use `ledgerByBlock`. */
+  block?: string;
+}
+
+// ---- engine 0.3 admin ---------------------------------------------------------------------------
+
+/**
+ * A surface's editorial list: the control arm, the rollout gate, the safety net and the fill for
+ * short slates. `by_anchor` maps an anchor's external id to the editor's list for that page.
+ */
+export interface SurfaceFallback {
+  kind: "newest" | "popular" | "curated";
+  item_ids?: string[];
+  by_anchor?: Record<string, string[]>;
+}
+
+/**
+ * The part of a surface kept in the customer's repository and applied with `applySurface`.
+ * Fields left out stay as they are. Status and testers move with their own calls.
+ */
+export interface SurfaceSpec {
+  surface: string;
+  item_kinds?: string[];
+  /** 1..50 */
+  slots?: number;
+  fallback?: SurfaceFallback;
+  /** 0..50; below this many eligible items the answer is shown=false with no items. 0 = always shown. */
+  min_slots?: number;
+  /** The app re-sorts on the device; every interaction must then carry displayed_position. */
+  device_resort?: boolean;
+  notes?: string;
+  exploration_share?: number;
+}
+
+/** What `applySurface` did or `planSurface` would do. `changes` is empty when unchanged. */
+export interface SurfacePlan {
+  surface: string;
+  changes: string[];
+  applied: boolean;
+}
+
+export interface MetricsQuery {
+  /** 1..180; default 28. */
+  days?: number;
+  /** Only slates seen in this block, and taps in it. */
+  block?: string;
+}
+
+/** One UTC day of a surface; `not_shown_share` and `client_abandoned_rate` come with engine 0.3. */
+export type MetricsDay = NonNullable<Schemas["SurfaceMetrics"]["days"]>[number];
+export type Settings = Schemas["Settings"];
+export type SettingsPatch = Schemas["SettingsPatch"];
+
+export interface Health {
+  status: string;
+  postgres?: string;
+  redis?: string;
+  /** The release (commit). */
+  version?: string;
+  /** Engine 0.3: the API version the engine serves (the contract's info.version). */
+  engine_version?: string;
 }
 
 export interface ExportJob {

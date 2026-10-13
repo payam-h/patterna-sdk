@@ -2,14 +2,48 @@
 
 Module `github.com/payam-h/patterna-sdk/go`. Tags are `go/vX.Y.Z` in
 [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk); install with
-`go get github.com/payam-h/patterna-sdk/go@v0.2.0`.
-SDK 0.2 needs engine 0.2 or later (the engine in production since release `7a7683e`).
+`go get github.com/payam-h/patterna-sdk/go@v0.3.0`.
+SDK 0.2 and 0.3 need engine 0.2 or later; the 0.3 fields take effect with engine 0.3 (API 0.2.0).
 
-## Unreleased
+## 0.3.0 (2026-10-13)
 
-- Works with engine 0.3 (API 0.2.0) unchanged: a `shown: false` answer (no items) is a normal 200
-  and is never abandoned; abandoning it would answer 409 `not_shown`. Not yet typed:
-  `context.control_item_ids`, `context.member_of`, and `control_source`, `fill_count` on `Slate`.
+Source-compatible with 0.2: every change adds a field, a method or a sentinel.
+
+### Added
+
+- **Editorial control lists.** `RecommendContext.ControlItemIDs` (at most 50): your own list for
+  the page, the control slate in that order and the fill in treatment. `Slate.ControlSource`
+  (`ControlSourceRequest`, `ControlSourceByAnchor`, `ControlSourceSurface`) says where an
+  editorial slate came from.
+- **Communities.** `RecommendContext.MemberOf` (at most 500): communities never offered to a
+  `non_profiled` session.
+- **Fill.** `Slate.FillCount` and `SlateItem.Fill`: the trailing positions filled from the
+  editorial list when the ranked candidates ran out. The SDK marks them from the count when the
+  engine does not mark slots itself (engine 0.3 does not).
+- **`Slate.ModelVersions`**, decoded when present (engine 0.3 logs it on the impression only).
+- **Hidden blocks.** `Recommendation.Shown`: false only for a `shown: false` answer, which
+  `RecommendWithFallback` and `RecommendMany` return as it is: no items, no fallback, never
+  abandoned. `Abandon` and `AbandonSync` refuse a slate this client received as `shown: false`
+  with `ErrNotShown` before sending; the engine's 409 `not_shown` maps to the same sentinel.
+- **Typed errors** `ErrModeRequired` (422 `mode_required`: `SetUserProfile` without a mode for a
+  user Patterna has no row for; returned, never a fallback) and `ErrNotShown` (409 `not_shown`).
+- **Coach events.** `CoachProductShown` and `CoachProductTapped` build `coach_product_shown` and
+  `coach_product_tapped` with `product_id`, `conversation_id`, `position` and the consent rules
+  (user id only in personalized and cohort, session id only in non_profiled).
+- **Admin.** `UpdateSurface`, `PlanSurface` and `ApplySurface` with `SurfaceSpec` (`min_slots`,
+  `device_resort`, `item_kinds`, `slots`, `fallback` with `by_anchor`, notes, exploration share);
+  `Surface.MinSlots`, `DeviceResort`, `TesterRequests7d` and `FallbackConfig()`;
+  `SurfaceMetrics` with `NotShownShare` and `ClientAbandonedRate`; `LedgerByBlock`,
+  `LedgerQuery.Block`, `LedgerRow.Block` and `ReadableSample`; `GetSettings`, `UpdateSettings`,
+  `SetPhaseTags`; `Health` with `EngineVersion`.
+- **CLI.** `patterna surface apply -f FILE|DIR [--dry-run]`, `patterna settings phase-tags
+  [on|off]`, `patterna ledger --by block` and `--block NAME`.
+
+### Fixed
+
+- `SetSurfaceStatus` and `SetSurfaceTesters` returned an almost empty `Surface`: the engine answers
+  `PATCH /surfaces/{key}` with `{key, ok}`, not the surface the contract describes. They now read
+  the surface back.
 
 ## 0.2.0 (2026-10-13)
 

@@ -33,6 +33,16 @@ type RecommendContext struct {
 	// rankers' training data. nil means true. Set it from the user's analytics consent with
 	// SetMeasured.
 	Measured *bool `json:"measured,omitempty"`
+	// ControlItemIDs (engine 0.3) is your own editorial list for this page: the article's
+	// "pairs with" products, the editor's related articles. In the control arm it is the slate, in
+	// this order, under the request's rules (logged with ControlSource "request"); in treatment it
+	// is the list short slates are filled from. At most 50 ids.
+	ControlItemIDs []string `json:"control_item_ids,omitempty"`
+	// MemberOf (engine 0.3) lists the community ids the user is in, so they are never offered.
+	// Meant for non_profiled requests, which have no identity to look membership up by; in
+	// personalized and cohort mode the engine also reads community_joined/community_left events.
+	// At most 500 ids.
+	MemberOf []string `json:"member_of,omitempty"`
 }
 
 // SetMeasured sets Measured from the user's analytics consent: false keeps the request out of
@@ -70,6 +80,42 @@ type Slate struct {
 	// Shown (engine 0.2) is false when the slate is shorter than the surface's min_slots: hide
 	// the block. Nil (an older engine) means shown. Use Visible.
 	Shown *bool `json:"shown,omitempty"`
+	// ControlSource (engine 0.3) says where an editorial slate came from: ControlSourceRequest
+	// (Context.ControlItemIDs), ControlSourceByAnchor (the surface's fallback.by_anchor list for the
+	// anchor) or ControlSourceSurface (the surface's own list). Empty on ranked slates.
+	ControlSource ControlSource `json:"control_source,omitempty"`
+	// FillCount (engine 0.3) is the number of trailing positions filled from the editorial list
+	// because the ranked candidates ran out (propensity 1). Those items have Fill set.
+	FillCount int `json:"fill_count,omitempty"`
+	// ModelVersions names the model version each learner that ranked the slate read (persona_bayes,
+	// user_bayes, item_sim, ranker, gbdt). Engine 0.3 logs it on the impression (trace, export)
+	// and does not send it with the answer yet, so it is nil there; it is decoded when present.
+	ModelVersions map[string]string `json:"model_versions,omitempty"`
+}
+
+// ControlSource is where an editorial (control) slate came from.
+type ControlSource string
+
+const (
+	ControlSourceRequest  ControlSource = "request"   // RecommendContext.ControlItemIDs
+	ControlSourceByAnchor ControlSource = "by_anchor" // the surface's fallback.by_anchor for the anchor
+	ControlSourceSurface  ControlSource = "surface"   // the surface's own fallback list
+)
+
+// markFills sets Fill on the trailing FillCount items when the engine did not mark them itself
+// (engine 0.3 sends fill_count on the slate and fill per slot only in its log).
+func (s *Slate) markFills() {
+	if s == nil || s.FillCount <= 0 {
+		return
+	}
+	for _, it := range s.Items {
+		if it.Fill {
+			return
+		}
+	}
+	for i := max(0, len(s.Items)-s.FillCount); i < len(s.Items); i++ {
+		s.Items[i].Fill = true
+	}
 }
 
 // Visible reports whether the block should be rendered: false only when the engine said
@@ -114,6 +160,9 @@ type SlateItem struct {
 	Generator string            `json:"generator,omitempty"`
 	Score     float64           `json:"score,omitempty"`
 	PhaseFit  []string          `json:"phase_fit,omitempty"`
+	// Fill (engine 0.3) is true when the slot was filled from the editorial list behind the ranked
+	// items (Slate.FillCount); the SDK sets it from FillCount when the engine does not send it.
+	Fill bool `json:"fill,omitempty"`
 }
 
 // InteractionType is what happened to a slot.

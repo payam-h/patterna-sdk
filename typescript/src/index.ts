@@ -5,7 +5,9 @@ export {
   DEFAULT_RECOMMEND_DEADLINE_MS,
   DEFAULT_RECOMMEND_TIMEOUT_MS,
   interactionFor,
+  markFills,
   measuredContext,
+  validateSurfaceSpec,
 } from "./client.js";
 export type { ManyRequest, PatternaClientOptions, Recommendation } from "./client.js";
 export type { FetchLike } from "./http.js";
@@ -31,4 +33,6 @@ export { withFallback } from "./fallback.js";
 export type { FallbackResult, WithFallbackOptions } from "./fallback.js";
 export { assignmentUnit, canonicalJson, computeEventSignature, signEvent } from "./signing.js";
 export { newSessionId } from "./session.js";
+export { coachProductShown, coachProductTapped, EVENT_COACH_PRODUCT_SHOWN, EVENT_COACH_PRODUCT_TAPPED } from "./coach.js";
+export type { CoachProduct } from "./coach.js";
 export type * from "./types.js";

@@ -37,6 +37,8 @@ export type SdkErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
  * | `unknown_item` | 404 | catalog calls |
  * | `pii_rejected` | 422 | rethrown: personal data in the request |
  * | `mode_conflict` | 422 | rethrown: the consent mode contradicts the stored one |
+ * | `mode_required` | 422 | `setUserProfile` without `mode` for a user Patterna has no row for (engine 0.3) |
+ * | `not_shown` | 409 | `abandon` named a slate answered `shown: false`: hide the block, never abandon (engine 0.3) |
  */
 export const ApiErrorCode = {
   NoCandidates: "no_candidates",
@@ -46,6 +48,8 @@ export const ApiErrorCode = {
   UnknownItem: "unknown_item",
   PiiRejected: "pii_rejected",
   ModeConflict: "mode_conflict",
+  ModeRequired: "mode_required",
+  NotShown: "not_shown",
 } as const;
 
 export type ApiErrorCodeValue = (typeof ApiErrorCode)[keyof typeof ApiErrorCode];
@@ -119,14 +123,15 @@ export function isApiError(err: unknown, code: ApiErrorCodeValue | string): err 
 }
 
 /**
- * Errors no fallback may hide: consent and input bugs, and the API's `pii_rejected` and
- * `mode_conflict`. A consent bug is a privacy bug.
+ * Errors no fallback may hide: consent and input bugs, and the API's `pii_rejected`,
+ * `mode_conflict` and `mode_required`. A consent bug is a privacy bug.
  */
 export function isCallerBug(err: unknown): boolean {
   return (
     err instanceof ConsentError ||
     err instanceof ValidationError ||
     isApiError(err, ApiErrorCode.PiiRejected) ||
-    isApiError(err, ApiErrorCode.ModeConflict)
+    isApiError(err, ApiErrorCode.ModeConflict) ||
+    isApiError(err, ApiErrorCode.ModeRequired)
   );
 }

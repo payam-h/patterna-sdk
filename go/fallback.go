@@ -13,6 +13,11 @@ type Recommendation struct {
 	// RequestID is the id the client minted and sent as X-Request-Id; equal to Slate.RequestID
 	// when Patterna answered. Log it next to your own trace.
 	RequestID string
+	// Shown says whether to render the block. False only when Patterna answered shown=false
+	// (fewer eligible items than the surface's min_slots): ItemIDs is then empty, the fallback is
+	// not used, and the slate is not abandoned (it counts in its arm with zero taps). Hide the
+	// block. True for every other answer, the fallback included.
+	Shown bool
 	// Fallback is true when ItemIDs came from the fallback function.
 	Fallback bool
 	// Abandoned is true when the fallback was used after the request reached the engine (timeout,
@@ -48,6 +53,9 @@ func (r Recommendation) Reason(itemID, locale string) string {
 // The request id is minted here, so on a timeout, network error or 5xx the client reports the
 // abandonment in the background (see Abandon) and Recommendation.RequestID still names the
 // request. An open breaker sends nothing, so there is nothing to abandon.
+//
+// A shown=false answer (engine 0.3: fewer eligible items than the surface's min_slots) is
+// returned as it is: Shown false, no items, no fallback, nothing abandoned. Hide the block.
 func (c *Client) RecommendWithFallback(ctx context.Context, req RecommendRequest, fallback func() []string, opts ...CallOption) (Recommendation, error) {
 	o := collect(opts)
 	if o.requestID == "" {
@@ -56,12 +64,12 @@ func (c *Client) RecommendWithFallback(ctx context.Context, req RecommendRequest
 	o.traceID = c.traceID(ctx, o)
 	slate, err := c.recommend(ctx, req, o)
 	if err == nil {
-		return Recommendation{ItemIDs: slate.ItemIDs(), Slate: slate, RequestID: slate.RequestID}, nil
+		return Recommendation{ItemIDs: slate.ItemIDs(), Slate: slate, RequestID: slate.RequestID, Shown: slate.Visible()}, nil
 	}
 	if isCallerBug(err) {
 		return Recommendation{RequestID: o.requestID}, err
 	}
-	rec := Recommendation{Fallback: true, Cause: err, RequestID: o.requestID}
+	rec := Recommendation{Fallback: true, Shown: true, Cause: err, RequestID: o.requestID}
 	if reason := abandonReason(err); reason != "" {
 		rec.Abandoned = c.enqueue("abandon", reportJob{requestID: o.requestID, abandon: reason, traceID: o.traceID}) == nil
 	}

@@ -1,19 +1,28 @@
 """patterna-sdk: Python client for the Patterna recommendation API."""
 
 from .client import (
+    CONTROL_SOURCE_BY_ANCHOR,
+    CONTROL_SOURCE_REQUEST,
+    CONTROL_SOURCE_SURFACE,
     DEFAULT_ADMIN_TIMEOUT_MS,
     DEFAULT_INGEST_TIMEOUT_MS,
     DEFAULT_RECOMMEND_DEADLINE_MS,
     DEFAULT_RECOMMEND_TIMEOUT_MS,
+    EVENT_COACH_PRODUCT_SHOWN,
+    EVENT_COACH_PRODUCT_TAPPED,
+    FALLBACK_KINDS,
     MODES,
     ManyRequest,
     PatternaClient,
     Recommendation,
     assert_opaque_user_id,
+    coach_product_shown,
+    coach_product_tapped,
     interaction_for,
     measured_context,
     new_request_id,
     rfc3339,
+    slate_visible,
     with_fallback,
 )
 from .errors import (
@@ -29,13 +38,19 @@ from .errors import (
 )
 from .signing import assignment_unit, canonical_json, compute_event_signature, sign_event
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
+    "CONTROL_SOURCE_BY_ANCHOR",
+    "CONTROL_SOURCE_REQUEST",
+    "CONTROL_SOURCE_SURFACE",
     "DEFAULT_ADMIN_TIMEOUT_MS",
     "DEFAULT_INGEST_TIMEOUT_MS",
     "DEFAULT_RECOMMEND_DEADLINE_MS",
     "DEFAULT_RECOMMEND_TIMEOUT_MS",
+    "EVENT_COACH_PRODUCT_SHOWN",
+    "EVENT_COACH_PRODUCT_TAPPED",
+    "FALLBACK_KINDS",
     "MODES",
     "ApiError",
     "ApiErrorCode",
@@ -50,6 +65,8 @@ __all__ = [
     "assert_opaque_user_id",
     "assignment_unit",
     "canonical_json",
+    "coach_product_shown",
+    "coach_product_tapped",
     "compute_event_signature",
     "interaction_for",
     "is_api_error",
@@ -58,5 +75,6 @@ __all__ = [
     "new_request_id",
     "rfc3339",
     "sign_event",
+    "slate_visible",
     "with_fallback",
 ]

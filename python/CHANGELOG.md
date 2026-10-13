@@ -3,13 +3,39 @@
 SDK 0.2 needs engine 0.2 or later (the engine in production since release `7a7683e`).
 
 Not on PyPI. Install from the public repository:
-`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.2.0#subdirectory=python"`.
+`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.3.0#subdirectory=python"`.
 
-## Unreleased
+## 0.3.0 (2026-10-13)
 
-- Works with engine 0.3 (API 0.2.0) unchanged: a `shown: false` answer (no items) is a normal 200
-  and is never abandoned; abandoning it would answer 409 `not_shown`. `context.control_item_ids`,
-  `context.member_of`, `control_source` and `fill_count` pass through the dicts untyped.
+Typed support for engine 0.3 (API 0.2.0). Still works against engine 0.2: the new keys are
+simply absent there.
+
+### Added
+
+- **`context.control_item_ids`** (at most 50) and **`context.member_of`** (at most 500) on
+  `recommend`, checked before sending.
+- **Slates**: `control_source` (constants `CONTROL_SOURCE_REQUEST`, `CONTROL_SOURCE_BY_ANCHOR`,
+  `CONTROL_SOURCE_SURFACE`), `fill_count`, and `fill: True` on the trailing filled items (set
+  from `fill_count` when the engine does not mark them), `model_versions` when present.
+- **`Recommendation.shown`**: False only for a `shown: false` answer, which is returned as
+  `source="patterna"` with no items; the fallback is not called and nothing is abandoned.
+  `slate_visible(slate)` for plain slates.
+- **`abandon()`** refuses a slate this client received as `shown: false` (`not_shown`, nothing
+  sent).
+- **Error codes** `ApiErrorCode.MODE_REQUIRED` (a caller bug, never hidden by a fallback) and
+  `ApiErrorCode.NOT_SHOWN`.
+- **Coach events**: `coach_product_shown(...)`, `coach_product_tapped(...)` and
+  `EVENT_COACH_PRODUCT_SHOWN` / `EVENT_COACH_PRODUCT_TAPPED`, with the consent identity rules.
+- **Admin**: `update_surface`, `plan_surface`, `apply_surface` (item_kinds, slots, fallback with
+  `by_anchor`, `min_slots`, `device_resort`, notes, exploration_share), `surface_metrics` (with
+  `not_shown_share`, `client_abandoned_rate`), `ledger(by="block" | block=...)` and
+  `ledger_by_block`, `get_settings`, `update_settings(phase_tags=)`, `set_phase_tags`, `health`
+  (`engine_version`).
+
+### Fixed
+
+- `set_surface_status` and `set_surface_testers` return the surface after the change: the
+  engine answers `PATCH /surfaces/{key}` with `{key, ok}`, so the client reads the surface back.
 
 ## 0.2.0 (2026-10-13)
 

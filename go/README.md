@@ -1,9 +1,11 @@
 # sdk-go: `github.com/payam-h/patterna-sdk/go`
 
-Version 0.2.0 (see `CHANGELOG.md`). Needs engine 0.2 or later, which is the engine in production.
+Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (anchored control
+lists, `shown: false`, fill) need engine 0.3 (API 0.2.0, `engine_version` 0.2.0), the engine in
+production.
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.2.0   # tag go/v0.2.0 in payam-h/patterna-sdk
+go get github.com/payam-h/patterna-sdk/go@v0.3.0   # tag go/v0.3.0 in payam-h/patterna-sdk
 ```
 
 Go client for the Patterna API, built for a customer backend in a request path (Elvou's Gin +
@@ -59,7 +61,10 @@ rec, err := pc.RecommendWithFallback(ctx, patterna.RecommendRequest{
 if err != nil {
 	return err // consent or input bug: never hidden behind the fallback
 }
-// rec.ItemIDs is always set; rec.Slate is nil when the fallback was used.
+if !rec.Shown {
+	return hideBlock() // shown=false: fewer eligible items than min_slots; never abandon it
+}
+// rec.ItemIDs is set when rec.Shown; rec.Slate is nil when the fallback was used.
 // rec.RequestID is always set: log it next to your trace. On a timeout or 5xx the client has
 // already told Patterna the slate was abandoned (rec.Abandoned).
 
@@ -99,6 +104,28 @@ if rec.Slate != nil {
   breaker was open (the request never left) or the engine refused the request with a 4xx (nothing
   was logged). Call `pc.Abandon(id, patterna.AbandonClientFallback)` yourself when a slate
   arrived but the app showed something else.
+- **Hidden blocks (engine 0.3).** A surface with `min_slots` answers `shown: false` with no items
+  when fewer items pass the request's rules (counted before the arm, so both arms hide alike).
+  `RecommendWithFallback` returns it as `Recommendation{Shown: false}`: no items, no fallback, no
+  abandonment. Hide the block. The slate counts in its arm with zero taps; abandoning it would be
+  409 `not_shown`, so `Abandon`/`AbandonSync` refuse it with `ErrNotShown` without sending when
+  this client served it. `Slate.Visible()` says the same for `Recommend`.
+- **Editorial control lists (engine 0.3).** `RecommendContext.ControlItemIDs` is your own list for
+  this page (an article's "pairs with" products, the editor's related articles; at most 50). In
+  the control arm it is the slate, in that order, under the request's rules; in treatment it fills
+  short slates. Without it the engine uses the surface's `fallback.by_anchor` list for
+  `AnchorItemID`, else the surface's own list. `Slate.ControlSource` says which
+  (`ControlSourceRequest`, `ControlSourceByAnchor`, `ControlSourceSurface`; empty on ranked
+  slates).
+- **Fill (engine 0.3).** When ranked candidates run out before `slots`, the rest comes from the
+  editorial list behind them: `Slate.FillCount` trailing positions, each with `SlateItem.Fill`
+  (set by the SDK from the count when the engine does not mark slots). They are ordinary slots for
+  interactions.
+- **Communities (engine 0.3).** `RecommendContext.MemberOf` lists the communities a session is in
+  (at most 500) so a `non_profiled` request never offers them; personalized and cohort requests
+  also use `community_joined`/`community_left` events.
+- **Model versions.** `Slate.ModelVersions` is decoded when present. Engine 0.3 logs it on the
+  impression (trace, export) and does not send it with the answer, so it is nil there today.
 - **Testers.** `pc.Recommend(ctx, req, patterna.WithTester())` sends
   `X-Patterna-Tester: 1`; your backend decides who is a tester, so staff need no random ids on a
   roster.
@@ -121,6 +148,8 @@ if rec.Slate != nil {
   | `ErrSurfaceOff` | 409 | fallback (the kill switch; that is its purpose) |
   | `ErrUnknownSurface` | 404 | fallback, but it is a config bug: alert on `rec.Cause` |
   | `ErrModeConflict` | 422 | **returned**: the consent mode contradicts the stored one |
+  | `ErrModeRequired` | 422 | `SetUserProfile` without `Mode` for a user Patterna has no row for: a profile never creates consent; set the mode first |
+  | `ErrNotShown` | 409 | `Abandon`, `AbandonSync`: the slate was answered `shown: false`; hide the block, never abandon it |
   | `ErrPIIRejected` | 422 | **returned**: personal data in the request |
   | `ErrUnknownRequest` | 404 | `AbandonSync`, `ReportInteractionsSync`: the engine never logged that id |
   | `ErrUnknownItem` | 404 | catalog calls |
@@ -131,6 +160,25 @@ if rec.Slate != nil {
 - **Consent.** A request needs a mode; `non_profiled` needs a session id and no user id. User ids
   that look like an email or an identity-provider subject are refused everywhere, and never
   appear in error text.
+
+## AI coach: products named in an answer
+
+```go
+ev, err := patterna.CoachProductShown(patterna.CoachProduct{
+	Mode: patterna.ModePersonalized, UserID: patternaID, // non_profiled: SessionID only
+	ProductID: "p_magnesium", ConversationID: convID, Position: 0,
+})
+if err != nil {
+	return err // consent or input bug
+}
+_, err = pc.IngestEvents(ctx, []patterna.Event{ev})
+```
+
+`CoachProductTapped` is the same for a tap (a positive signal). Both carry `product_id` (the
+catalog `external_id`), `conversation_id` (your opaque id, never message text) and `position`
+(0-based among the answer's products), and apply the consent rules: the user id only in
+`personalized` and `cohort`, the rotating session id only in `non_profiled`. No slate and no
+propensity: a learning signal and a descriptive count, never in the ledger.
 
 ## Several surfaces in one call
 
@@ -210,14 +258,18 @@ All three SDKs sign with the bytes of the secret string; the shared vector is
 
 `admin.New(pc)` on a client with an `AdminKey`: `ListFlows`, `GetFlow`, `CreateFlow`,
 `ActivateFlow`, `RollbackFlow`, `PlanFlow`, `ApplyFlow`, `ListSurfaces`, `GetSurface`,
-`SetSurfaceStatus`, `SetSurfaceTesters`, `ListExperiments`, `StartExperiment`, `EndExperiment`,
-`Ledger`, `LedgerWeeks`, `ExportLedger`, `ExportStatus`, `CreateSigningSecret`,
-`RotateSigningSecret`.
+`SetSurfaceStatus`, `SetSurfaceTesters`, `UpdateSurface`, `PlanSurface`, `ApplySurface`,
+`SurfaceMetrics`, `ListExperiments`, `StartExperiment`, `EndExperiment`, `Ledger`,
+`LedgerByBlock`, `LedgerWeeks`, `ExportLedger`, `ExportStatus`, `GetSettings`, `UpdateSettings`,
+`SetPhaseTags`, `Health`, `CreateSigningSecret`, `RotateSigningSecret`.
+
+The engine answers `PATCH /surfaces/{key}` with `{key, ok}` rather than the surface; the
+surface calls read it back, so they return the surface after the change.
 
 The CLI keeps flow configs in your repository and applies them in CI:
 
 ```sh
-go install github.com/payam-h/patterna-sdk/go/cmd/patterna@go/v0.2.0
+go install github.com/payam-h/patterna-sdk/go/cmd/patterna@go/v0.3.0
 export PATTERNA_URL=https://patterna-api.orven.am/v1 PATTERNA_ADMIN_KEY=...   # CI secret, never a flag
 
 patterna flow get --surface more_to_read > patterna/flows/more_to_read.json  # once, to start
@@ -226,9 +278,13 @@ patterna flow apply -f patterna/flows/             # on merge: create + activate
 patterna flow rollback --surface more_to_read
 patterna surface status --surface more_to_read off # kill switch
 patterna surface testers --surface more_to_read u_1,u_2
+patterna surface apply -f patterna/surfaces/ --dry-run   # min_slots, device_resort, by_anchor, ...
+patterna surface apply -f patterna/surfaces/
+patterna settings phase-tags on                    # phase_fit in slates; off by default
 patterna experiment start -f patterna/experiments/more_to_read.json
 patterna experiment end <id>
 patterna ledger --surface more_to_read --from 2026-09-01 --to 2026-10-01
+patterna ledger --by block --surface more_to_read   # one row per block; descriptive
 patterna ledger export --from 2026-09-01 --to 2026-10-01 --wait
 patterna signing-secret create                     # prints the secret alone on stdout
 ```
@@ -237,6 +293,25 @@ A flow file is `{"surface": "...", "note": "...", "config": {FlowConfig}}` or an
 `apply` compares configs as canonical JSON: unchanged when the active version matches, reuses
 an existing version with the same config, otherwise creates one. `--activate=false` only stores
 it. On a tenant with the two-person rule, activation answers 409 `approval_required`.
+
+A surface file sets the surface fields you keep in the repository; fields left out stay as they
+are, and status and testers move with their own commands:
+
+```json
+{
+  "surface": "pairs_with",
+  "item_kinds": ["product"],
+  "slots": 4,
+  "min_slots": 2,
+  "device_resort": false,
+  "fallback": {"kind": "curated", "item_ids": ["p_1", "p_2"],
+               "by_anchor": {"doc_magnesium_sleep": ["p_magnesium", "p_glycine"]}}
+}
+```
+
+`surface apply` validates the file (unknown keys fail, `min_slots` 0..50, `slots` 1..50, known
+kinds, a fallback kind of newest, popular or curated) and patches only the fields that differ.
+The fallback is replaced as a whole, so keep the complete list and `by_anchor` map in the file.
 
 ## Releases and tags
 
@@ -247,7 +322,7 @@ path to `github.com/payam-h/patterna-sdk/go`, and tags `v<version>` and `go/v<ve
 then needs nothing but:
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.2.0
+go get github.com/payam-h/patterna-sdk/go@v0.3.0
 ```
 
 Bump `CHANGELOG.md` with each release. A v2 would need `/v2` at the end of the public module path.
@@ -258,19 +333,15 @@ Built: serve and ingest scopes, context deadlines and the server deadline header
 breaker, one retry for idempotent calls, bounded fire-and-forget interaction and abandonment
 reporting with drain on Close, `RecommendWithFallback` and `RecommendMany`, consent and opaque-id
 checks, assignment units, event signing with the cross-language vector, typed errors, the admin
-package and the CLI. Table-driven tests with `httptest` (race detector on), `go vet` and
-`staticcheck` clean.
-
-Not yet in the SDK: the request fields `context.control_item_ids` (the caller's own editorial
-list, the control slate for this page) and `context.member_of` (communities to exclude) are not on
-`RecommendContext`, and `control_source` and `fill_count` are not on `Slate` (engine 0.3, API
-0.2.0). They need an SDK update. A `shown: false` answer is a normal 200 and is never abandoned:
-the SDK abandons only after a timeout, a network error or a 5xx.
+package and the CLI, and every engine 0.3 field (control lists, `member_of`, `control_source`,
+fill, `shown: false`, coach product events, `mode_required`, `not_shown`, surface files, phase
+tags, per-block ledger rows, `engine_version`). Table-driven tests with `httptest` and an
+in-memory fake engine (`internal/fakeengine`; race detector on), `go vet` and `staticcheck` clean.
 
 Deliberately left out:
 
-- Admin endpoints beyond flows, surfaces, experiments, ledger and the signing secret (keys,
-  curation, settings): the panel owns them; `AdminCall` reaches any of them.
+- Admin endpoints beyond flows, surfaces, experiments, ledger, phase tags and the signing secret
+  (keys, curation, the other settings): the panel owns them; `AdminCall` reaches any of them.
 - Types are hand-written, not generated: an `oapi-codegen` step would pull in a dependency for
   ten structs. `make contracts` does not touch them; change `types.go` with the contract.
 - No metrics library: `OnBreakerChange`, `DroppedReports` and `Recommendation.Cause` give the

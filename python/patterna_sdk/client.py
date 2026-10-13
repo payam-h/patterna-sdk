@@ -4,6 +4,10 @@ Budgets are per attempt: recommend 150 ms and never retried (each call logs an i
 ingest calls 5 s and retried once on 5xx or a network error (they are idempotent on event id);
 admin calls 30 s. Every call sends a client-minted X-Request-Id; recommend also asks the engine to
 answer within X-Deadline-Ms (120 ms by default, engine 0.2).
+
+Engine 0.3 (API 0.2.0): `context.control_item_ids` and `context.member_of` on recommend; slates
+carry `control_source`, `fill_count` and `fill` per filled slot; a `shown: false` answer has no
+items and is never abandoned (409 `not_shown`).
 """
 
 from __future__ import annotations
@@ -49,6 +53,20 @@ _HEADER_ID = re.compile(r"^[\x21-\x7e]{1,64}$")
 _MAX_INTERACTIONS = 50
 _MAX_ITEMS = 500
 _MAX_BLOCK = 64
+_MAX_CONTROL_ITEMS = 50
+_MAX_MEMBER_OF = 500
+
+# Where an editorial (control) slate came from (engine 0.3, slate["control_source"]).
+CONTROL_SOURCE_REQUEST = "request"  # context.control_item_ids
+CONTROL_SOURCE_BY_ANCHOR = "by_anchor"  # the surface's fallback.by_anchor list for the anchor
+CONTROL_SOURCE_SURFACE = "surface"  # the surface's own fallback list
+
+# Fallback kinds of a surface's editorial list.
+FALLBACK_KINDS: tuple[str, ...] = ("newest", "popular", "curated")
+
+# Event types for products an AI coach answer named (engine 0.3, contracts/events.md).
+EVENT_COACH_PRODUCT_SHOWN = "coach_product_shown"
+EVENT_COACH_PRODUCT_TAPPED = "coach_product_tapped"
 
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, dict[str, str], bytes]]
 F = TypeVar("F")
@@ -101,6 +119,144 @@ def _invalid(op: str, message: str) -> ValidationError:
     return ValidationError(message, op=op, code="invalid_argument")
 
 
+def slate_visible(slate: dict[str, Any] | None) -> bool:
+    """Whether to render the block: False only when the engine answered shown=false.
+
+    An absent `shown` (an older engine) means shown.
+    """
+    return slate is not None and slate.get("shown") is not False
+
+
+def _mark_fills(slate: dict[str, Any]) -> None:
+    """Set fill=True on the trailing fill_count items unless the engine marked any item itself.
+
+    Engine 0.3 sends fill_count on the slate and fill per slot only in its log.
+    """
+    n = slate.get("fill_count")
+    items = slate.get("items")
+    if not isinstance(n, int) or n <= 0 or not isinstance(items, list):
+        return
+    if any(isinstance(it, dict) and it.get("fill") for it in items):
+        return
+    for it in items[max(0, len(items) - n) :]:
+        if isinstance(it, dict):
+            it["fill"] = True
+
+
+def _coach_event(
+    typ: str,
+    *,
+    mode: str,
+    user_id: str | None,
+    session_id: str | None,
+    product_id: str,
+    conversation_id: str,
+    position: int,
+    occurred_at: datetime | str | None,
+    event_id: str | None,
+    source: str,
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if mode not in MODES:
+        raise ConsentError(f"mode must be one of {MODES}", op=typ, code="consent_required")
+    if mode == "non_profiled":
+        if user_id:
+            raise ConsentError(
+                "non_profiled events must not carry a user_id", op=typ, code="consent_violation"
+            )
+        if not session_id:
+            raise ConsentError(
+                "non_profiled events need the rotating session_id", op=typ, code="consent_violation"
+            )
+    else:
+        if not user_id:
+            raise _invalid(typ, f"{mode} events need the user_id")
+        assert_opaque_user_id(user_id)
+    if not str(product_id or "").strip() or not str(conversation_id or "").strip():
+        raise _invalid(typ, "product_id and conversation_id are required")
+    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        raise _invalid(typ, "position is 0-based and never negative")
+    ts = occurred_at if occurred_at is not None else datetime.now(timezone.utc)
+    ev: dict[str, Any] = {
+        "event_id": event_id or new_request_id(),
+        "type": typ,
+        "occurred_at": rfc3339(ts) if isinstance(ts, datetime) else ts,
+        "source": source or "backend",
+        "props": {"product_id": product_id, "conversation_id": conversation_id, "position": position},
+    }
+    if mode == "non_profiled":
+        ev["session_id"] = session_id
+    else:
+        ev["user_id"] = user_id
+    if context is not None:
+        ev["context"] = context
+    return ev
+
+
+def coach_product_shown(
+    *,
+    mode: str,
+    product_id: str,
+    conversation_id: str,
+    position: int,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    occurred_at: datetime | str | None = None,
+    event_id: str | None = None,
+    source: str = "backend",
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A coach_product_shown event (engine 0.3) for `ingest_events`.
+
+    A product an LLM answer named, shown under the answer. `product_id` is the catalog external_id,
+    `conversation_id` your own opaque id (never message text), `position` the 0-based place among
+    the answer's products. Identity follows consent: user_id in personalized and cohort (required),
+    the rotating session_id only in non_profiled. No slate, no propensity: never in the ledger.
+    """
+    return _coach_event(
+        EVENT_COACH_PRODUCT_SHOWN,
+        mode=mode,
+        user_id=user_id,
+        session_id=session_id,
+        product_id=product_id,
+        conversation_id=conversation_id,
+        position=position,
+        occurred_at=occurred_at,
+        event_id=event_id,
+        source=source,
+        context=context,
+    )
+
+
+def coach_product_tapped(
+    *,
+    mode: str,
+    product_id: str,
+    conversation_id: str,
+    position: int,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    occurred_at: datetime | str | None = None,
+    event_id: str | None = None,
+    source: str = "backend",
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A coach_product_tapped event (a positive signal); same rules as `coach_product_shown`."""
+    return _coach_event(
+        EVENT_COACH_PRODUCT_TAPPED,
+        mode=mode,
+        user_id=user_id,
+        session_id=session_id,
+        product_id=product_id,
+        conversation_id=conversation_id,
+        position=position,
+        occurred_at=occurred_at,
+        event_id=event_id,
+        source=source,
+        context=context,
+    )
+
+
 def measured_context(context: dict[str, Any], analytics_consent: bool) -> dict[str, Any]:
     """Copy of `context` with `measured` (engine 0.2) set from the user's analytics consent.
 
@@ -129,6 +285,11 @@ class Recommendation(Generic[F]):
     source is "patterna" (value is the slate) or "fallback" (value is what your fallback returned).
     request_id is always the id sent as X-Request-Id. abandoned is true when the abandonment was
     queued in the background (timeout, network error, 5xx).
+
+    shown says whether to render the block. False only when Patterna answered shown=false (engine
+    0.3: fewer eligible items than the surface's min_slots): the slate has no items, the fallback
+    was not called and nothing is abandoned (the slate counts in its arm with zero taps). True for
+    every other answer, the fallback included.
     """
 
     source: str
@@ -136,6 +297,7 @@ class Recommendation(Generic[F]):
     request_id: str
     error: PatternaError | None = None
     abandoned: bool = False
+    shown: bool = True
 
 
 @dataclass
@@ -177,7 +339,7 @@ class PatternaClient:
         trace_id: Callable[[], str | None] | None = None,
         on_background_error: Callable[[PatternaError], None] | None = None,
         slate_memory: int = 4096,
-        user_agent: str = "patterna-sdk-python/0.2.0",
+        user_agent: str = "patterna-sdk-python/0.3.0",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.keys = {"serve": serve_key, "ingest": ingest_key, "admin": admin_key}
@@ -199,6 +361,7 @@ class PatternaClient:
         self.user_agent = user_agent
         self._slate_memory = max(0, slate_memory)
         self._kinds: OrderedDict[str, dict[str, str]] = OrderedDict()
+        self._not_shown: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
         self._background: ThreadPoolExecutor | None = None
 
@@ -241,7 +404,17 @@ class PatternaClient:
         trace_id: str | None = None,
         tester: bool = False,
     ) -> dict[str, Any]:
-        """Rank a slate. Never retried. `tester` sends X-Patterna-Tester: 1 (engine 0.2)."""
+        """Rank a slate. Never retried. `tester` sends X-Patterna-Tester: 1 (engine 0.2).
+
+        Engine 0.3 context keys: `control_item_ids` (your own editorial list for this page, at most
+        50: the control slate in this order, and the list short treatment slates are filled from)
+        and `member_of` (community ids the user is in, at most 500, never offered; meant for
+        non_profiled requests). The slate carries `control_source` (request, by_anchor or surface)
+        on editorial slates, `fill_count`, and `fill: True` on the trailing filled items (set
+        here from fill_count when the engine does not send it). `model_versions` is decoded when
+        present; engine 0.3 logs it on the impression only. A `shown: False` answer has no items:
+        hide the block and never abandon it.
+        """
         if mode not in MODES:
             raise ConsentError(f"mode must be one of {MODES}", op="recommend", code="consent_required")
         if mode == "non_profiled":
@@ -262,6 +435,10 @@ class PatternaClient:
             if session_id:
                 body["session_id"] = session_id
         if context:
+            if len(context.get("control_item_ids") or ()) > _MAX_CONTROL_ITEMS:
+                raise _invalid("recommend", f"context.control_item_ids is limited to {_MAX_CONTROL_ITEMS}")
+            if len(context.get("member_of") or ()) > _MAX_MEMBER_OF:
+                raise _invalid("recommend", f"context.member_of is limited to {_MAX_MEMBER_OF}")
             body["context"] = context
         if slots is not None:
             body["slots"] = slots
@@ -292,6 +469,7 @@ class PatternaClient:
         )
         if not slate.get("request_id"):
             slate["request_id"] = rid
+        _mark_fills(slate)
         self._remember(slate)
         return slate
 
@@ -303,11 +481,16 @@ class PatternaClient:
         The request id is minted here, so on a timeout, network error, 5xx or unreadable answer the
         abandonment is sent in the background (engine 0.2). Consent and input bugs, pii_rejected and
         mode_conflict are raised, never hidden. kwargs are those of `recommend`.
+
+        A shown=false answer (engine 0.3) comes back as source "patterna" with shown=False: no
+        items, no fallback, nothing abandoned. Hide the block.
         """
         rid = _clean_id(kwargs.pop("request_id", None)) or new_request_id()
         try:
             slate = self.recommend(surface, request_id=rid, **kwargs)
-            return Recommendation("patterna", slate, str(slate.get("request_id") or rid))
+            return Recommendation(
+                "patterna", slate, str(slate.get("request_id") or rid), shown=slate_visible(slate)
+            )
         except PatternaError as e:
             if is_caller_bug(e):
                 raise
@@ -346,9 +529,22 @@ class PatternaClient:
 
         `recommend_with_fallback` does it for you; call it when a slate arrived but you showed
         something else. An id the engine never logged raises ApiError unknown_request.
+
+        A slate answered shown=false is never abandoned (it already counts in its arm with zero
+        taps): when this client served it, PatternaError not_shown is raised without sending;
+        otherwise the engine answers ApiError not_shown (409).
         """
         if not request_id:
             raise _invalid("abandon", "request_id is required")
+        with self._lock:
+            not_shown = request_id in self._not_shown
+        if not_shown:
+            raise PatternaError(
+                "the slate was answered shown=false: hide the block, do not abandon it",
+                op="abandon",
+                code="not_shown",
+                request_id=request_id,
+            )
         if reason not in _ABANDON_REASONS:
             raise _invalid("abandon", f"reason must be one of {sorted(_ABANDON_REASONS)}")
         return self._call(
@@ -553,6 +749,12 @@ class PatternaClient:
     def set_user_profile(
         self, user_id: str, profile: dict[str, Any], *, timeout_ms: int | None = None
     ) -> dict[str, Any]:
+        """Declared attributes as tag affinities; never health values.
+
+        A profile never creates consent (engine 0.3): without `mode` in the profile, a user
+        Patterna has no row for raises ApiError mode_required (422); set the mode in the profile
+        or call set_user_mode first. An existing user keeps their mode.
+        """
         assert_opaque_user_id(user_id)
         return self._call(
             "set_user_profile",
@@ -604,9 +806,7 @@ class PatternaClient:
             raise _invalid("set_surface_status", "surface key is required")
         if status not in _SURFACE_STATUSES:
             raise _invalid("set_surface_status", "status must be shadow, testers, live or off")
-        return dict(
-            self._admin("set_surface_status", "PATCH", f"/surfaces/{quote(key, safe='')}", {"status": status})
-        )
+        return self._patch_surface("set_surface_status", key, {"status": status})
 
     def set_surface_testers(self, key: str, user_ids: Sequence[str]) -> dict[str, Any]:
         """Replace the tester roster: at most 200 random user ids, never emails."""
@@ -616,14 +816,121 @@ class PatternaClient:
             raise _invalid("set_surface_testers", "at most 200 testers")
         for uid in user_ids:
             assert_opaque_user_id(uid)
-        return dict(
-            self._admin(
-                "set_surface_testers",
-                "PATCH",
-                f"/surfaces/{quote(key, safe='')}",
-                {"testers": list(user_ids)},
-            )
-        )
+        return self._patch_surface("set_surface_testers", key, {"testers": list(user_ids)})
+
+    def _patch_surface(self, op: str, key: str, body: dict[str, Any]) -> dict[str, Any]:
+        out = self._admin(op, "PATCH", f"/surfaces/{quote(key, safe='')}", body)
+        if isinstance(out, dict) and out.get("status"):
+            return out
+        # The engine answers {"key", "ok"} rather than the surface the contract describes: read the
+        # surface back so callers see its state after the change.
+        return self.get_surface(key)
+
+    def update_surface(self, key: str, spec: dict[str, Any]) -> dict[str, Any]:
+        """PATCH the fields `spec` sets (see `apply_surface`) and return the surface after it.
+
+        spec["surface"] is ignored; `key` names the surface.
+        """
+        spec = {**spec, "surface": key}
+        _validate_surface_spec(spec)
+        body = _surface_body(spec)
+        if not body:
+            raise _invalid("update_surface", "nothing to change")
+        return self._patch_surface("update_surface", key, body)
+
+    def plan_surface(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Compare `spec` with the surface as it is: {"surface", "changes", "applied": False}.
+
+        `changes` lists the differing fields in a fixed order (item_kinds, slots, fallback,
+        min_slots, device_resort, notes, exploration_share); empty when unchanged. Nothing is written.
+        """
+        _validate_surface_spec(spec)
+        cur = self.get_surface(spec["surface"])
+        changes: list[str] = []
+        kinds = spec.get("item_kinds")
+        if kinds and set(kinds) != set(cur.get("item_kinds") or []):
+            changes.append("item_kinds")
+        for f in ("slots",):
+            if spec.get(f) is not None and spec[f] != cur.get(f):
+                changes.append(f)
+        if spec.get("fallback") is not None and _norm_fallback(spec["fallback"]) != _norm_fallback(
+            cur.get("fallback")
+        ):
+            changes.append("fallback")
+        if spec.get("min_slots") is not None and spec["min_slots"] != (cur.get("min_slots") or 0):
+            changes.append("min_slots")
+        if spec.get("device_resort") is not None and bool(spec["device_resort"]) != bool(
+            cur.get("device_resort")
+        ):
+            changes.append("device_resort")
+        if spec.get("notes") is not None and spec["notes"] != (cur.get("notes") or ""):
+            changes.append("notes")
+        if spec.get("exploration_share") is not None and spec["exploration_share"] != cur.get(
+            "exploration_share"
+        ):
+            changes.append("exploration_share")
+        return {"surface": spec["surface"], "changes": changes, "applied": False}
+
+    def apply_surface(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Make the surface match `spec` (engine 0.3), for surface files kept in your repository.
+
+        spec: {"surface", "item_kinds"?, "slots"?, "fallback"?: {"kind", "item_ids"?, "by_anchor"?},
+        "min_slots"?, "device_resort"?, "notes"?, "exploration_share"?}; absent keys stay as they
+        are. Only the differing fields are patched, nothing when none differ. The fallback is
+        replaced as a whole (kind, item_ids and by_anchor together).
+        """
+        plan = self.plan_surface(spec)
+        if not plan["changes"]:
+            return plan
+        body = _surface_body(spec)
+        self._patch_surface("apply_surface", spec["surface"], {f: body[f] for f in plan["changes"]})
+        plan["applied"] = True
+        return plan
+
+    def surface_metrics(
+        self, key: str, *, days: int | None = None, block: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Daily metrics of a surface (UTC days, zero-filled): the "days" list.
+
+        Each day has impressions, taps, tap_rate, fallback_rate, p99_ms, explored_share,
+        unmeasured_share, and (engine 0.3) client_abandoned_rate and not_shown_share (slates
+        answered shown=false over all slates). Rates are None when their denominator is 0.
+        """
+        if not key:
+            raise _invalid("surface_metrics", "surface key is required")
+        if days is not None and not 1 <= days <= 180:
+            raise _invalid("surface_metrics", "days must be 1 to 180")
+        _check_block("surface_metrics", block)
+        q: dict[str, str] = {}
+        if block:
+            q["block"] = block
+        if days is not None:
+            q["days"] = str(days)
+        path = f"/surfaces/{quote(key, safe='')}/metrics" + (f"?{urlencode(sorted(q.items()))}" if q else "")
+        out = self._admin("surface_metrics", "GET", path)
+        days_out = out.get("days") if isinstance(out, dict) else None
+        return list(days_out or [])
+
+    def get_settings(self) -> dict[str, Any]:
+        """Tenant settings, including phase_tags (engine 0.3)."""
+        return dict(self._admin("get_settings", "GET", "/settings"))
+
+    def update_settings(self, *, phase_tags: bool | None = None) -> None:
+        """PATCH /settings (owners and admin keys). phase_tags turns phase_fit metadata on in slates."""
+        body: dict[str, Any] = {}
+        if phase_tags is not None:
+            body["phase_tags"] = bool(phase_tags)
+        if not body:
+            raise _invalid("update_settings", "nothing to change")
+        self._admin("update_settings", "PATCH", "/settings", body)
+
+    def set_phase_tags(self, on: bool) -> None:
+        """Turn phase_fit on or off for the tenant (engine 0.3; off by default)."""
+        self.update_settings(phase_tags=on)
+
+    def health(self) -> dict[str, Any]:
+        """GET /health: status, version (the release) and engine_version (the API version served)."""
+        return dict(self._admin("health", "GET", "/health"))
 
     def list_flows(self, surface: str) -> list[dict[str, Any]]:
         if not surface:
@@ -744,13 +1051,34 @@ class PatternaClient:
         date_from: str | None = None,
         date_to: str | None = None,
         weekly: bool = False,
+        by: str | None = None,
+        block: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Ledger rows (one per surface), or weekly rows per arm with weekly=True. Dates are YYYY-MM-DD."""
+        """Ledger rows (one per surface), or weekly rows per arm with weekly=True. Dates are YYYY-MM-DD.
+
+        Engine 0.3: by="block" gives one row per surface and block, block="name" one block only;
+        those rows carry "block" and are descriptive (the whole-slate row decides).
+        """
+        if by is not None and by != "block":
+            raise _invalid("ledger", "by must be 'block' or None")
+        if weekly and (by or block):
+            raise _invalid("ledger", "weekly rows have no block dimension")
+        _check_block("ledger", block)
         q = {k: v for k, v in (("surface", surface), ("from", date_from), ("to", date_to)) if v}
         if weekly:
             q["bucket"] = "week"
+        if by:
+            q["by"] = by
+        elif block:
+            q["block"] = block
         path = "/proof/ledger" + (f"?{urlencode(q)}" if q else "")
         return self._list(self._admin("ledger", "GET", path), "ledger")
+
+    def ledger_by_block(
+        self, *, surface: str | None = None, date_from: str | None = None, date_to: str | None = None
+    ) -> list[dict[str, Any]]:
+        """`ledger(by="block")`: one row per surface and block (engine 0.3)."""
+        return self.ledger(surface=surface, date_from=date_from, date_to=date_to, by="block")
 
     def export_ledger(self, date_from: str, date_to: str, *, surface: str | None = None) -> dict[str, Any]:
         """Queue an export of impressions and interactions; poll export_status until 'done'."""
@@ -798,13 +1126,17 @@ class PatternaClient:
             for it in slate.get("items", [])
             if it.get("kind") and it.get("kind") != "document"
         }
-        if not kinds:
-            return
         with self._lock:
-            self._kinds.pop(rid, None)
-            self._kinds[rid] = kinds
-            while len(self._kinds) > self._slate_memory:
-                self._kinds.popitem(last=False)
+            if not slate_visible(slate):
+                self._not_shown.pop(rid, None)
+                self._not_shown[rid] = None
+                while len(self._not_shown) > self._slate_memory:
+                    self._not_shown.popitem(last=False)
+            if kinds:
+                self._kinds.pop(rid, None)
+                self._kinds[rid] = kinds
+                while len(self._kinds) > self._slate_memory:
+                    self._kinds.popitem(last=False)
 
     def _check_interaction(self, request_id: str, it: dict[str, Any], i: int, op: str) -> None:
         if not it.get("item_id"):
@@ -935,13 +1267,82 @@ class PatternaClient:
         raise last or NetworkError(f"{op}: no attempt made", op=op, code="network")  # pragma: no cover
 
 
+def _check_block(op: str, block: str | None) -> None:
+    if block is not None and len(block) > 32:
+        raise _invalid(op, "block is a short name of at most 32 characters")
+
+
+def _validate_surface_spec(spec: dict[str, Any]) -> None:
+    op = "apply_surface"
+    if not spec.get("surface"):
+        raise _invalid(op, "surface key is required")
+    slots = spec.get("slots")
+    if slots is not None and not 1 <= slots <= 50:
+        raise _invalid(op, "slots must be 1 to 50")
+    ms = spec.get("min_slots")
+    if ms is not None and not 0 <= ms <= 50:
+        raise _invalid(op, "min_slots must be 0 to 50")
+    ex = spec.get("exploration_share")
+    if ex is not None and not 0 <= ex <= 1:
+        raise _invalid(op, "exploration_share must be 0 to 1")
+    notes = spec.get("notes")
+    if notes is not None and len(notes) > 4000:
+        raise _invalid(op, "notes holds at most 4000 characters")
+    for k in spec.get("item_kinds") or ():
+        if k not in _ITEM_KINDS:
+            raise _invalid(op, f"unknown item kind {k!r}")
+    fb = spec.get("fallback")
+    if fb is not None:
+        if not isinstance(fb, dict) or fb.get("kind") not in FALLBACK_KINDS:
+            raise _invalid(op, "fallback.kind must be newest, popular or curated")
+        if fb["kind"] == "curated" and not fb.get("item_ids"):
+            raise _invalid(op, "a curated fallback needs item_ids")
+        for anchor, ids in (fb.get("by_anchor") or {}).items():
+            if not anchor or not ids:
+                raise _invalid(op, "fallback.by_anchor maps an anchor id to a non-empty list")
+    unknown = set(spec) - {
+        "surface",
+        "item_kinds",
+        "slots",
+        "fallback",
+        "min_slots",
+        "device_resort",
+        "notes",
+        "exploration_share",
+    }
+    if unknown:
+        raise _invalid(op, f"unknown surface keys {sorted(unknown)}")
+
+
+def _surface_body(spec: dict[str, Any]) -> dict[str, Any]:
+    b: dict[str, Any] = {}
+    if spec.get("item_kinds"):
+        b["item_kinds"] = list(spec["item_kinds"])
+    for f in ("slots", "fallback", "min_slots", "device_resort", "notes", "exploration_share"):
+        if spec.get(f) is not None:
+            b[f] = spec[f]
+    return b
+
+
+def _norm_fallback(fb: Any) -> Any:
+    if not isinstance(fb, dict):
+        return fb
+    out = {"kind": fb.get("kind")}
+    if fb.get("item_ids"):
+        out["item_ids"] = list(fb["item_ids"])
+    if fb.get("by_anchor"):
+        out["by_anchor"] = {k: list(v) for k, v in fb["by_anchor"].items()}
+    return out
+
+
 def with_fallback(
     fn: Callable[[], dict[str, Any]], fallback: Callable[[], dict[str, Any]]
 ) -> tuple[dict[str, Any], PatternaError | None]:
     """Serve from Patterna, or from your own list when it fails, and tell the caller which happened.
 
     Consent and input bugs, pii_rejected and mode_conflict are raised, never hidden. Prefer
-    `PatternaClient.recommend_with_fallback`, which also reports abandoned slates.
+    `PatternaClient.recommend_with_fallback`, which also reports abandoned slates and `shown`.
+    A shown=false slate is returned as it is (no fallback): check `slate_visible(slate)`.
     """
     try:
         return fn(), None

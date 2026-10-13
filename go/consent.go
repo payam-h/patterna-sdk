@@ -70,6 +70,12 @@ func validateRecommend(req RecommendRequest) error {
 	if len(req.ExcludeItemIDs) > maxExcludes {
 		return newError(CodeInvalidArgument, op, "exclude_item_ids is limited to %d", maxExcludes)
 	}
+	if len(req.Context.ControlItemIDs) > maxControlItems {
+		return newError(CodeInvalidArgument, op, "context.control_item_ids is limited to %d", maxControlItems)
+	}
+	if len(req.Context.MemberOf) > maxMemberOf {
+		return newError(CodeInvalidArgument, op, "context.member_of is limited to %d", maxMemberOf)
+	}
 	if req.AssignmentUnit != "" && !hmacHex.MatchString(req.AssignmentUnit) {
 		return newError(CodeInvalidArgument, op,
 			"assignment_unit must be AssignmentUnit(secret, userID): 64 lowercase hex characters, never a raw id")

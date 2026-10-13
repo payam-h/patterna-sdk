@@ -25,10 +25,17 @@ const (
 //
 // RecommendWithFallback calls it for you on a timeout, network error or 5xx. Call it yourself when
 // you received a slate and still showed something else.
+//
+// A slate answered shown=false (Slate.Visible false) is never abandoned: it already counts in its
+// arm with zero taps. When this client served it, Abandon returns ErrNotShown without sending;
+// otherwise the engine answers 409 not_shown (AbandonSync returns it, Abandon drops it).
 func (c *Client) Abandon(requestID string, reason AbandonReason, opts ...CallOption) error {
 	const op = "abandon"
 	if requestID == "" {
 		return newError(CodeInvalidArgument, op, "request id is required")
+	}
+	if c.kinds.notShown(requestID) {
+		return notShownError(op, requestID)
 	}
 	if reason == "" {
 		reason = AbandonClientFallback
@@ -38,10 +45,13 @@ func (c *Client) Abandon(requestID string, reason AbandonReason, opts ...CallOpt
 }
 
 // AbandonSync is Abandon that waits for the answer. A request the engine never logged answers
-// ErrUnknownRequest.
+// ErrUnknownRequest; a slate answered shown=false answers ErrNotShown.
 func (c *Client) AbandonSync(ctx context.Context, requestID string, reason AbandonReason, opts ...CallOption) error {
 	if requestID == "" {
 		return newError(CodeInvalidArgument, "abandon", "request id is required")
+	}
+	if c.kinds.notShown(requestID) {
+		return notShownError("abandon", requestID)
 	}
 	if reason == "" {
 		reason = AbandonClientFallback
@@ -58,4 +68,9 @@ func (c *Client) sendAbandon(ctx context.Context, requestID string, reason Aband
 		op: "abandon", method: http.MethodPost, path: "/recommendations/" + url.PathEscape(requestID) + "/abandon",
 		body: map[string]any{"reason": reason}, scope: scopeServe, timeout: c.cfg.IngestTimeout, idempotent: true, opts: o, background: true,
 	}, nil)
+}
+
+func notShownError(op, requestID string) *Error {
+	return &Error{Code: CodeNotShown, Op: op, RequestID: requestID,
+		Message: "the slate was answered shown=false: hide the block, do not abandon it", notSent: true}
 }

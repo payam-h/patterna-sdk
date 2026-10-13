@@ -159,7 +159,7 @@ describe("recommendWithFallback and abandonment", () => {
   it("returns the slate and its id when Patterna answers", async () => {
     const m = mockFetch({ status: 200, body: slate });
     const r = await client(m.fetch).recommendWithFallback(req, () => []);
-    expect(r).toEqual({ source: "patterna", value: slate, requestId: "req_1" });
+    expect(r).toEqual({ source: "patterna", value: slate, requestId: "req_1", shown: true });
   });
 
   it("rethrows mode_conflict, pii_rejected and consent bugs", async () => {
@@ -387,9 +387,12 @@ describe("admin", () => {
     await expect(a.getSurface("missing")).rejects.toMatchObject({ code: "unknown_surface" });
     const notList = admin(mockFetch({ status: 200, body: { key: "s" } }).fetch);
     await expect(notList.listSurfaces()).rejects.toMatchObject({ code: "bad_response" });
+    // the engine answers PATCH with {key, ok}, so the surface is read back after each change
     expect(m.calls.map((x) => `${x.method} ${x.url.slice(BASE.length)}`)).toEqual([
       "PATCH /surfaces/s",
+      "GET /surfaces",
       "PATCH /surfaces/s",
+      "GET /surfaces",
       "POST /experiments",
       "POST /experiments/exp%201/end",
       "GET /proof/ledger?surface=s&from=2026-09-01&to=2026-10-01",
@@ -399,6 +402,6 @@ describe("admin", () => {
       "GET /surfaces",
     ]);
     expect(m.calls[0]!.body).toEqual({ status: "off" });
-    expect(m.calls[1]!.body).toEqual({ testers: ["u_1"] });
+    expect(m.calls[2]!.body).toEqual({ testers: ["u_1"] });
   });
 });

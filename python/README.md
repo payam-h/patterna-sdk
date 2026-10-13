@@ -1,16 +1,17 @@
 # patterna-sdk (Python)
 
-Version 0.2.0 (see `CHANGELOG.md`). Needs engine 0.2 or later, which is the engine in production.
+Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 additions need engine 0.3
+(API 0.2.0), which is the engine in production.
 
 Python client for the Patterna API, with the same shape as `patterna-sdk` (TypeScript) and the
 Go SDK: serve, ingest and admin calls, a consent gate, typed errors, one retry on idempotent
 calls, client-minted request ids with abandonment, and event signatures and assignment units that
 share test vectors across the three SDKs. No dependencies: `urllib` and `hmac` only. Python 3.10+.
 
-Not on PyPI. Install it from the public repository at tag `v0.2.0`:
+Not on PyPI. Install it from the public repository at tag `v0.3.0`:
 
 ```sh
-pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.2.0#subdirectory=python"
+pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.3.0#subdirectory=python"
 # inside this monorepo: pip install -e packages/sdk-py
 ```
 
@@ -115,20 +116,66 @@ patterna.report_interactions(slate["request_id"], [top, *rest])
 ## Admin (admin key)
 
 For CI scripts that keep flow configs in your repository: `list_surfaces`, `get_surface`,
-`set_surface_status`, `set_surface_testers`, `list_flows`, `get_flow`, `create_flow`,
+`set_surface_status`, `set_surface_testers`, `update_surface`, `plan_surface`, `apply_surface`,
+`surface_metrics`, `list_flows`, `get_flow`, `create_flow`,
 `activate_flow`, `rollback_flow`, `plan_flow`, `apply_flow(surface, config, note=, activate=)`,
 `list_experiments`, `start_experiment`, `end_experiment`, `ledger(surface=, date_from=,
-date_to=, weekly=)`, `export_ledger`, `export_status`, `create_signing_secret`,
-`rotate_signing_secret`. `apply_flow` compares configs as canonical JSON; nothing happens when the
+date_to=, weekly=, by=, block=)`, `ledger_by_block`, `export_ledger`, `export_status`,
+`get_settings`, `update_settings(phase_tags=)`, `set_phase_tags`, `health`,
+`create_signing_secret`, `rotate_signing_secret`. `apply_flow` compares configs as canonical JSON; nothing happens when the
 active version matches. The Go SDK ships the same as a CLI (`packages/sdk-go/cmd/patterna`).
 
-## Not yet in the SDK
+## Engine 0.3
 
-No typed fields yet for the engine 0.3 (API 0.2.0) additions. `context` is passed through as a
-dict and the slate comes back as a dict, so `context.control_item_ids` (the caller's own editorial
-list, the control slate for this page), `context.member_of` (communities to exclude) and the
-answer's `control_source` and `fill_count` work today without types. A `shown: false` answer is a
-normal 200 and is never abandoned: the SDK abandons only after a timeout, a network error or a 5xx.
+**Control list per page.** `context.control_item_ids` (at most 50) is your own editorial list for
+this page: in the control arm it is the slate, in this order; in treatment it fills short slates.
+`context.member_of` (at most 500) lists communities the user is in, never offered (meant for
+`non_profiled`). Both limits are checked before sending.
+
+```python
+slate = patterna.recommend(
+    "pairs_with",
+    mode="non_profiled",
+    session_id=sid,
+    context={"locale": "nl", "anchor_item_id": article_id, "control_item_ids": editor_picks},
+)
+slate.get("control_source")  # "request" | "by_anchor" | "surface" on editorial slates
+slate.get("fill_count")  # trailing items filled from the editorial list; they carry "fill": True
+```
+
+`model_versions` is decoded when present; engine 0.3 logs it on the impression (trace, export)
+and does not send it on the answer.
+
+**`shown: false`.** Below the surface's `min_slots` the answer has no items. Hide the block and
+never abandon it: `recommend_with_fallback` returns `source="patterna"`, `shown=False`, does not
+call your fallback and abandons nothing; `abandon()` on such a slate raises `not_shown` without
+sending (the engine would answer 409 `not_shown`). `slate_visible(slate)` does the check on a
+plain slate. Fallbacks and ordinary slates have `shown=True`.
+
+**Errors.** `ApiErrorCode.MODE_REQUIRED` (422: `set_user_profile` without `mode` for a user
+Patterna has no row for; set the mode first) and `ApiErrorCode.NOT_SHOWN` (409).
+
+**Coach products.** Products an AI coach answer named, for `ingest_events`:
+
+```python
+patterna.ingest_events(
+    [
+        coach_product_shown(
+            mode="personalized", user_id=pid, product_id="p_mag", conversation_id=conv_id, position=0
+        ),
+    ]
+)
+```
+
+`coach_product_tapped` takes the same arguments. A `non_profiled` user passes `session_id`
+instead of `user_id`; the helper enforces it.
+
+**Surface files.** `apply_surface({"surface": "pairs_with", "min_slots": 3, "device_resort": True,
+"fallback": {"kind": "curated", "item_ids": [...], "by_anchor": {"doc_9": ["p_1", "p_2"]}}})`
+patches only the fields that differ (`plan_surface` says which, writing nothing). The fallback
+is replaced as a whole. `surface_metrics(key, days=, block=)` adds `not_shown_share` and
+`client_abandoned_rate`; `ledger_by_block()` returns one row per surface and block;
+`set_phase_tags(True)` turns `phase_fit` on; `health()["engine_version"]`.
 
 ## Signing
 

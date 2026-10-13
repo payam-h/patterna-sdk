@@ -1,6 +1,8 @@
 // Package admin wraps the admin-scope endpoints a customer needs to keep its Patterna setup in
-// its own repository: flows (get, create, activate, rollback, apply), surface status and testers,
-// experiments (start, end), the proof ledger and its export, and the signing secret.
+// its own repository: flows (get, create, activate, rollback, apply), surfaces (status, testers,
+// and the settings in a surface file: slots, item kinds, the editorial fallback with by_anchor,
+// min_slots, device_resort), surface metrics, experiments (start, end), the proof ledger (per
+// block too) and its export, tenant settings (phase_tags), the signing secret and health.
 //
 // It runs on a *patterna.Client configured with an AdminKey, so it shares that client's
 // transport: deadlines (Config.AdminTimeout, default 30 s), one retry for idempotent calls, the
@@ -68,6 +70,25 @@ type Surface struct {
 	Impressions7d     int             `json:"impressions_7d,omitempty"`
 	TapRate7d         *float64        `json:"tap_rate_7d,omitempty"`
 	ExperimentID      *string         `json:"experiment_id,omitempty"`
+	// DeviceResort (engine 0.3): the app re-sorts the slate on the device; every interaction must
+	// then carry displayed_position.
+	DeviceResort bool `json:"device_resort,omitempty"`
+	// MinSlots (engine 0.3): below this many eligible items the answer is shown=false with no
+	// items. 0 = always shown.
+	MinSlots         int `json:"min_slots,omitempty"`
+	TesterRequests7d int `json:"tester_requests_7d,omitempty"`
+}
+
+// FallbackConfig decodes Surface.Fallback.
+func (s *Surface) FallbackConfig() (*SurfaceFallback, error) {
+	if s == nil || len(s.Fallback) == 0 || string(s.Fallback) == "null" {
+		return nil, nil
+	}
+	var f SurfaceFallback
+	if err := json.Unmarshal(s.Fallback, &f); err != nil {
+		return nil, err
+	}
+	return &f, nil
 }
 
 // ListSurfaces returns every surface of the tenant.
@@ -99,6 +120,11 @@ func (c *Client) patchSurface(ctx context.Context, op, key string, body map[stri
 	err := c.call(ctx, patterna.AdminRequest{Op: op, Method: http.MethodPatch, Path: surfacePath(key), Body: body, Idempotent: true}, &out, opts)
 	if err != nil {
 		return nil, err
+	}
+	if out.Status == "" {
+		// The engine answers {"key", "ok"} rather than the surface the contract describes: read
+		// the surface back so callers see its state after the change.
+		return c.GetSurface(ctx, key, opts...)
 	}
 	return &out, nil
 }
@@ -395,29 +421,37 @@ type LedgerQuery struct {
 	Surface string
 	From    string
 	To      string
+	// Block (engine 0.3) restricts the rows to one UI block (at most 32 characters). For every
+	// block use LedgerByBlock.
+	Block string
 }
 
 // LedgerRow is one surface's proof: treatment against control with a user-clustered interval.
 type LedgerRow struct {
-	PeriodStart           string   `json:"period_start"`
-	PeriodEnd             string   `json:"period_end"`
-	Surface               string   `json:"surface"`
-	Metric                string   `json:"metric"`
-	ControlRate           float64  `json:"control_rate"`
-	TreatmentRate         float64  `json:"treatment_rate"`
-	Difference            float64  `json:"difference"`
-	CILow                 *float64 `json:"ci_low"`
-	CIHigh                *float64 `json:"ci_high"`
-	NControl              int      `json:"n_control"`
-	NTreatment            int      `json:"n_treatment"`
-	NUsersControl         int      `json:"n_users_control"`
-	NUsersTreatment       int      `json:"n_users_treatment"`
-	SRMP                  float64  `json:"srm_p"`
-	Note                  string   `json:"note,omitempty"`
-	Readable              bool     `json:"readable"`
-	RevenueCentsControl   *int64   `json:"revenue_cents_control,omitempty"`
-	RevenueCentsTreatment *int64   `json:"revenue_cents_treatment,omitempty"`
-	ExportURI             *string  `json:"export_uri,omitempty"`
+	PeriodStart     string   `json:"period_start"`
+	PeriodEnd       string   `json:"period_end"`
+	Surface         string   `json:"surface"`
+	Metric          string   `json:"metric"`
+	ControlRate     float64  `json:"control_rate"`
+	TreatmentRate   float64  `json:"treatment_rate"`
+	Difference      float64  `json:"difference"`
+	CILow           *float64 `json:"ci_low"`
+	CIHigh          *float64 `json:"ci_high"`
+	NControl        int      `json:"n_control"`
+	NTreatment      int      `json:"n_treatment"`
+	NUsersControl   int      `json:"n_users_control"`
+	NUsersTreatment int      `json:"n_users_treatment"`
+	SRMP            float64  `json:"srm_p"`
+	Note            string   `json:"note,omitempty"`
+	Readable        bool     `json:"readable"`
+	// ReadableSample is the units per arm the row needs to be readable (the power calculation).
+	ReadableSample int `json:"readable_sample,omitempty"`
+	// Block (engine 0.3) is set on per-block rows (LedgerByBlock, LedgerQuery.Block): slates the
+	// client reported seen in that block and taps in it. Descriptive; the whole-slate row decides.
+	Block                 string  `json:"block,omitempty"`
+	RevenueCentsControl   *int64  `json:"revenue_cents_control,omitempty"`
+	RevenueCentsTreatment *int64  `json:"revenue_cents_treatment,omitempty"`
+	ExportURI             *string `json:"export_uri,omitempty"`
 }
 
 func (q LedgerQuery) values() url.Values {
@@ -431,13 +465,38 @@ func (q LedgerQuery) values() url.Values {
 	if q.To != "" {
 		v.Set("to", q.To)
 	}
+	if q.Block != "" {
+		v.Set("block", q.Block)
+	}
 	return v
 }
 
-// Ledger returns one summary row per surface.
+func checkBlock(op, block string) error {
+	if len(block) > 32 {
+		return invalid(op, "block is a short name of at most 32 characters")
+	}
+	return nil
+}
+
+// Ledger returns one summary row per surface (one row for q.Block when it is set).
 func (c *Client) Ledger(ctx context.Context, q LedgerQuery, opts ...patterna.CallOption) ([]LedgerRow, error) {
+	if err := checkBlock("ledger", q.Block); err != nil {
+		return nil, err
+	}
 	var out []LedgerRow
 	err := c.call(ctx, patterna.AdminRequest{Op: "ledger", Method: http.MethodGet, Path: "/proof/ledger", Query: q.values(), Idempotent: true}, &out, opts)
+	return out, err
+}
+
+// LedgerByBlock (engine 0.3: by=block) returns one row per surface and block, over the slates
+// the client reported seen in that block (Interaction.Block) and the taps in it. Descriptive: the
+// whole-slate row from Ledger decides. q.Block is ignored.
+func (c *Client) LedgerByBlock(ctx context.Context, q LedgerQuery, opts ...patterna.CallOption) ([]LedgerRow, error) {
+	q.Block = ""
+	v := q.values()
+	v.Set("by", "block")
+	var out []LedgerRow
+	err := c.call(ctx, patterna.AdminRequest{Op: "ledgerByBlock", Method: http.MethodGet, Path: "/proof/ledger", Query: v, Idempotent: true}, &out, opts)
 	return out, err
 }
 

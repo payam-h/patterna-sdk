@@ -1,6 +1,6 @@
 {
 	"name": "patterna-sdk",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Patterna client for backends, browsers and React Native: recommendations, interactions, events and catalog.",
 	"license": "MIT",
 	"type": "module",

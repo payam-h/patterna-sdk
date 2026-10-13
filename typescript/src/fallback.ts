@@ -1,8 +1,13 @@
 import { isCallerBug, PatternaError } from "./errors.js";
 
+/**
+ * `shown` (engine 0.3) says whether to render the block: false only when `fn` returned a slate
+ * answered `shown: false` (fewer eligible items than the surface's min_slots). Then the fallback
+ * is not used and nothing may be abandoned: hide the block. True for every other result.
+ */
 export type FallbackResult<T, F> =
-  | { source: "patterna"; value: T }
-  | { source: "fallback"; value: F; error: PatternaError };
+  | { source: "patterna"; value: T; shown: boolean }
+  | { source: "fallback"; value: F; error: PatternaError; shown: true };
 
 export interface WithFallbackOptions {
   /**
@@ -31,13 +36,18 @@ export async function withFallback<T, F>(
   options: WithFallbackOptions = {},
 ): Promise<FallbackResult<T, F>> {
   try {
-    return { source: "patterna", value: await fn() };
+    const value = await fn();
+    return { source: "patterna", value, shown: !isNotShown(value) };
   } catch (err) {
     if (!(err instanceof PatternaError)) throw err;
     if (isCallerBug(err)) throw err;
     const mode = options.on ?? "unavailable";
     if (mode === "timeout" && err.code !== "timeout") throw err;
     options.onFallback?.(err);
-    return { source: "fallback", value: await fallback(), error: err };
+    return { source: "fallback", value: await fallback(), error: err, shown: true };
   }
+}
+
+function isNotShown(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { shown?: unknown }).shown === false;
 }

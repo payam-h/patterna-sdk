@@ -39,6 +39,8 @@ const (
 	maxEvents       = 500
 	maxItems        = 500
 	maxExcludes     = 200
+	maxControlItems = 50
+	maxMemberOf     = 500
 	maxBlockLen     = 64
 	maxErrorBody    = 64 << 10
 )
@@ -266,6 +268,7 @@ func (c *Client) recommend(ctx context.Context, req RecommendRequest, o callOpts
 	if out.RequestID == "" {
 		out.RequestID = o.requestID
 	}
+	out.markFills()
 	c.kinds.remember(&out)
 	return &out, nil
 }
@@ -471,6 +474,10 @@ func (c *Client) SetUserMode(ctx context.Context, userID string, mode Mode, opts
 }
 
 // SetUserProfile stores declared attributes as tag affinities. Never health values.
+//
+// A profile never creates consent (engine 0.3): without profile.Mode, a user Patterna has no row
+// for answers ErrModeRequired (422 mode_required); set the mode in the profile or call
+// SetUserMode first. An existing user keeps their mode.
 func (c *Client) SetUserProfile(ctx context.Context, userID string, profile UserProfile, opts ...CallOption) error {
 	const op = "setUserProfile"
 	if err := CheckUserID(op, userID); err != nil {

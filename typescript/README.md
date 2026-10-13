@@ -1,37 +1,34 @@
 # patterna-sdk
 
-Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (control lists,
-`shown: false`, fills, coach events, the new admin calls) need engine 0.3 (`engine_version`
-0.2.0), which is the engine in production; the 0.4 fields (request context, editorial
-attributes, activity events, the new flow generators and filters) take effect with engine round 5
-(API 0.3.0) and are ignored before it.
+Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+version), and every field in this release is live on it. Works against engine 0.2 or later;
+older engines ignore the fields they do not know.
 
-**Install.** The npm name is `patterna-sdk`, and it is not published yet: `npm install
-patterna-sdk` returns 404 today. Until it is, build it from the public repository
-[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.4.0`:
+**Install.** The npm package is `patterna-sdk` (unscoped); pin the version:
 
 ```sh
-git clone --branch v0.4.0 https://github.com/payam-h/patterna-sdk.git
-cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.4.0.tgz
-cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.4.0.tgz
+npm install patterna-sdk@0.4.0
 ```
 
-In this monorepo the package is `@patterna/sdk` (private); the release script renames it.
+The source is the public repository [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk),
+directory `typescript/`, tag `v0.4.0`.
 
 TypeScript client for the Patterna API. One package for three places:
 
 - **a backend** (Node 22+, Bun, Deno, edge runtimes) holding the scoped API keys;
 - **a browser or React Native / Expo app** talking to *your* backend proxy, never to Patterna
   with a key;
-- **tooling and tests**, with the contract types generated from `contracts/openapi.yaml`.
+- **tooling and tests**, with the contract types generated from the OpenAPI contract
+  (https://patterna.orven.am/docs/openapi.yaml).
 
 ESM + CJS, TypeScript strict, zero runtime dependencies. Only `fetch`, `AbortController`,
 `setTimeout` and, for signing, WebCrypto. No Node built-ins in the core (eslint enforces it).
 
 ## Fifteen-minute tour
 
+In a checkout of `typescript/`:
+
 ```sh
-cd packages/sdk-ts
 npm ci
 npm test          # vitest, mocked fetch, ~0.3 s
 npm run check     # tsc --noEmit + eslint + vitest + tsup build
@@ -153,7 +150,7 @@ rules (user id in personalized and cohort, session id only in non_profiled) and 
 
 ### Signals: context, editorial attributes, activity events (engine round 5)
 
-Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+Everything the engine reads is listed at https://patterna.orven.am/docs/signals; these are the SDK's parts of it.
 
 ```ts
 import { timeContext, TIER_FREE } from "patterna-sdk";
@@ -284,7 +281,7 @@ For CI scripts that keep flow configs in your repository: `listSurfaces`, `getSu
 `listExperiments`, `startExperiment`, `endExperiment`, `ledger`, `ledgerWeeks`,
 `exportLedger`, `exportStatus`, `createSigningSecret`, `rotateSigningSecret`.
 `applyFlow` compares configs as canonical JSON: nothing happens when the active version
-matches. The Go SDK ships the same as a CLI (`packages/sdk-go/cmd/patterna`).
+matches. The Go SDK ships the same as a CLI (`patterna`, in the `go/` module).
 
 Engine 0.3:
 
@@ -492,14 +489,12 @@ Deliberately left out:
 
 - Admin endpoints beyond surfaces, flows, experiments, ledger, metrics, phase tags and the
   signing secret (keys, curation, the other settings): the panel owns them.
-- A circuit breaker: backends that need one use `packages/sdk-go`; in an app `withFallback` and
+- A circuit breaker: backends that need one use the Go SDK; in an app `withFallback` and
   the per-call budget are enough.
 - No persistent queue for abandonments: they are fire-and-forget promises. In a backend that
   shuts down, a few may be lost; the Go SDK drains its queue on `Close`.
-- Not on npm yet: publishing `patterna-sdk` 0.4.0 is pending. Build it from the public
-  repository as shown at the top.
 
 Settled since 0.1: the user endpoints (`/users/{id}/mode`, `/users/{id}/profile`,
 `DELETE /users/{id}`) accept the ingest key (the SDK uses the admin key when configured, else the
-ingest key), and the engine verifies signatures over the canonical form above, as written in
-`contracts/events.md`.
+ingest key), and the engine verifies signatures over the canonical form above, as the events
+contract describes (https://patterna.orven.am/docs/reference-event-types).

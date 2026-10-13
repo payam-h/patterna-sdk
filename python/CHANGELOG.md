@@ -1,9 +1,10 @@
 # Changelog: patterna-sdk (Python)
 
-SDK 0.2 to 0.4 need engine 0.2 or later (the engine in production since release `7a7683e`).
-
-Not on PyPI. Install from the public repository:
+Current release: 0.4.0. Not on PyPI (by decision); install from the public repository:
 `pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"`.
+The production engine reports `engine_version: 0.3.1` (the contract version) and every key below is
+live on it; SDK 0.2 to 0.4 work against engine 0.2 or later, and older engines ignore the keys they
+do not know.
 
 ## 0.4.0 (2026-10-13)
 

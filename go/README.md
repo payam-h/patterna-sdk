@@ -1,24 +1,22 @@
 # sdk-go: `github.com/payam-h/patterna-sdk/go`
 
-Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (anchored control
-lists, `shown: false`, fill) need engine 0.3 (API 0.2.0, `engine_version` 0.2.0), the engine in
-production; the 0.4 fields (request context, editorial attributes, activity events, the new flow
-generators and filters) take effect with engine round 5 (API 0.3.0) and are ignored before it.
+Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+version), and every field in this release is live on it. Works against engine 0.2 or later;
+older engines ignore the fields they do not know.
 
 ```sh
 go get github.com/payam-h/patterna-sdk/go@v0.4.0   # tag go/v0.4.0 in payam-h/patterna-sdk
 ```
 
-Go client for the Patterna API, built for a customer backend in a request path (Elvou's Gin +
-gqlgen backend is the first user; see `docs/elvou-integration.md`).
-Standard library only. Go 1.25.
+Go client for the Patterna API, built for a customer backend in a request path (the Gin + gqlgen
+backend of a women's health app is the first user). Standard library only. Go 1.25.
+
+In a checkout of the module directory (`go/` in the public repository):
 
 ```sh
-cd packages/sdk-go
 go test -race ./...
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
-# or from the repo root: make sdk-go
 ```
 
 (With an older local Go, prefix `GOTOOLCHAIN=auto`.)
@@ -37,7 +35,7 @@ go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
 | `consent.go` | consent gate and the opaque-user-id check |
 | `signing.go` | canonical JSON and HMAC-SHA256 event signatures (same bytes as `patterna-sdk`) |
 | `errors.go` | `*Error`, codes, sentinels for `errors.Is` |
-| `types.go` | hand-written mirror of `contracts/openapi.yaml` |
+| `types.go` | hand-written mirror of the OpenAPI contract (https://patterna.orven.am/docs/openapi.yaml) |
 | `admin/` | flows, surfaces, experiments, ledger, signing secret (admin key) |
 | `cmd/patterna/` | the CLI on top of `admin` |
 | `internal/fakeengine/` | in-memory admin endpoints for the admin and CLI tests |
@@ -65,7 +63,7 @@ if err != nil {
 if !rec.Shown {
 	return hideBlock() // shown=false: fewer eligible items than min_slots; never abandon it
 }
-// rec.ItemIDs is set when rec.Shown; rec.Slate is nil when the fallback was used.
+// rec.ItemIDs is empty only when rec.Shown is false; rec.Slate is nil when the fallback was used.
 // rec.RequestID is always set: log it next to your trace. On a timeout or 5xx the client has
 // already told Patterna the slate was abandoned (rec.Abandoned).
 
@@ -101,7 +99,7 @@ if rec.Slate != nil {
 - **Abandoned slates.** When `RecommendWithFallback` falls back after the request
   reached the engine (timeout, network error, 5xx, unreadable answer) it queues
   `POST /recommendations/{id}/abandon` with the reason, so the impression is flagged
-  `client_fallback` and the fallback rate and the ledger stay honest. Nothing is sent when the
+  `client_abandoned` (reason `client_fallback`) and the fallback rate and the ledger stay honest. Nothing is sent when the
   breaker was open (the request never left) or the engine refused the request with a 4xx (nothing
   was logged). Call `pc.Abandon(id, patterna.AbandonClientFallback)` yourself when a slate
   arrived but the app showed something else.
@@ -122,9 +120,10 @@ if rec.Slate != nil {
   editorial list behind them: `Slate.FillCount` trailing positions, each with `SlateItem.Fill`
   (set by the SDK from the count when the engine does not mark slots). They are ordinary slots for
   interactions.
-- **Communities (engine 0.3).** `RecommendContext.MemberOf` lists the communities a session is in
-  (at most 500) so a `non_profiled` request never offers them; personalized and cohort requests
-  also use `community_joined`/`community_left` events.
+- **Communities (engine 0.3).** `RecommendContext.MemberOf` lists the communities the user is in
+  (at most 500); the engine leaves them out in every mode. It is the only source for a
+  `non_profiled` request; personalized and cohort requests also use the stored
+  `community_joined`/`community_left` events.
 - **Model versions.** `Slate.ModelVersions` is decoded when present. Engine 0.3 logs it on the
   impression (trace, export) and does not send it with the answer, so it is nil there today.
 - **Testers.** `pc.Recommend(ctx, req, patterna.WithTester())` sends
@@ -153,7 +152,7 @@ if rec.Slate != nil {
   | `ErrNotShown` | 409 | `Abandon`, `AbandonSync`: the slate was answered `shown: false`; hide the block, never abandon it |
   | `ErrPIIRejected` | 422 | **returned**: personal data in the request |
   | `ErrUnknownRequest` | 404 | `AbandonSync`, `ReportInteractionsSync`: the engine never logged that id |
-  | `ErrUnknownItem` | 404 | catalog calls |
+  | `ErrUnknownItem` | 422 | `ReportInteractionsSync`: an item id that was not in the slate (API code `unknown_item`). Catalog calls answer 404 `item_not_found`, a plain `*Error`: test it with `IsAPIError(err, "item_not_found")` |
   | `ErrConsentRequired`, `ErrConsentViolation`, `ErrInvalidArgument`, `ErrNotConfigured` | - | **returned**, nothing sent |
   | `ErrTimeout`, `ErrNetwork`, `ErrCircuitOpen`, other 5xx | - | fallback |
 
@@ -164,7 +163,7 @@ if rec.Slate != nil {
 
 ## Signals: context, editorial attributes, activity events (engine round 5)
 
-Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+Everything the engine reads is listed at https://patterna.orven.am/docs/signals; these are the SDK's parts of it.
 
 **Request context.** Next to `HourBucket`, `Platform`, `Region` and `SessionItems`:
 
@@ -278,10 +277,12 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 
 ## Interactions: kind, re-sorting and split blocks
 
-- **`Kind`** is required for anything that is not a document.
-  When this client served the slate it knows the kinds, and an empty `Kind` on a community,
-  product, event or tip is an `ErrInvalidArgument` before anything is sent.
-  `slate.Interaction(itemID, type, at)` fills `Kind` and `Position` from the slate.
+- **`Kind`** is required by this SDK for anything that is not a document, as a check on the
+  caller: the engine itself ignores it and records the kind and position from the slate it logged
+  (the contract says so). When this client served the slate it knows the kinds, and an empty
+  `Kind` on a community, product, event or tip is an `ErrInvalidArgument` before anything is sent.
+  `slate.Interaction(itemID, type, at)` fills `Kind` and `Position` from the slate. `OccurredAt`
+  is required by the contract.
 - **`DisplayedPosition`**: when the app re-sorts on the device (a surface with `device_resort`), keep
   `Position` as the served slot and set `DisplayedPosition` to where it was shown.
 - **`Block`**: when one slate is split across UI blocks, name the block. Example: a
@@ -312,7 +313,7 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 
 - **`Measured`.** `req.Context.SetMeasured(analyticsConsent)`: with `false` the
   slate is ranked and shown but left out of the ledger and the training data. Unset means
-  measured. At Elvou, pass the user's `analytics` consent.
+  measured. Pass the user's usage-analytics consent.
 - **`AssignmentUnit`.** For `non_profiled` traffic under a holdout, the rotating
   session id would put one person in both arms. Send
   `req.AssignmentUnit = patterna.AssignmentUnit(experimentSecret, yourUserID)`: hex
@@ -347,7 +348,7 @@ surface calls read it back, so they return the surface after the change.
 The CLI keeps flow configs in your repository and applies them in CI:
 
 ```sh
-go install github.com/payam-h/patterna-sdk/go/cmd/patterna@go/v0.4.0
+go install github.com/payam-h/patterna-sdk/go/cmd/patterna@v0.4.0   # the module tag is go/v0.4.0; go resolves it from @v0.4.0
 export PATTERNA_URL=https://patterna-api.orven.am/v1 PATTERNA_ADMIN_KEY=...   # CI secret, never a flag
 
 patterna flow get --surface more_to_read > patterna/flows/more_to_read.json  # once, to start
@@ -393,17 +394,15 @@ The fallback is replaced as a whole, so keep the complete list and `by_anchor` m
 
 ## Releases and tags
 
-Customers install the SDK from the public mirror, not from this repository. `scripts/sdk-release.sh
-<version> --push` (or the `sdk-release` workflow on an `sdk/v<version>` tag) copies this directory to
-[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) under `go/`, rewrites the module
-path to `github.com/payam-h/patterna-sdk/go`, and tags `v<version>` and `go/v<version>`. A consumer
-then needs nothing but:
+Releases live in [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) under `go/`,
+tagged `v<version>` and `go/v<version>` (the Go module tag for a module in a subdirectory). Pin a
+version, never `latest`:
 
 ```sh
 go get github.com/payam-h/patterna-sdk/go@v0.4.0
 ```
 
-Bump `CHANGELOG.md` with each release. A v2 would need `/v2` at the end of the public module path.
+`CHANGELOG.md` lists every release. A v2 would need `/v2` at the end of the module path.
 
 ## Status
 
@@ -428,4 +427,4 @@ Deliberately left out:
 - No metrics library: `OnBreakerChange`, `DroppedReports` and `Recommendation.Cause` give the
   numbers; wire them into whatever the host uses.
 
-Open questions: see `packages/sdk-ts/README.md` (same two, tracked in `docs/ISSUES.md`).
+Open questions and what is built so far: https://patterna.orven.am/docs/status.

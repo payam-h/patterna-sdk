@@ -2,9 +2,9 @@
 
 Module `github.com/payam-h/patterna-sdk/go`. Tags are `go/vX.Y.Z` in
 [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk); install with
-`go get github.com/payam-h/patterna-sdk/go@v0.4.0`.
-SDK 0.2 to 0.4 need engine 0.2 or later; the 0.3 fields take effect with engine 0.3 (API 0.2.0),
-the 0.4 fields with engine round 5 (API 0.3.0; older engines ignore them).
+`go get github.com/payam-h/patterna-sdk/go@v0.4.0`. Current release: 0.4.0. The production engine
+reports `engine_version: 0.3.1` (the contract version) and every field below is live on it; SDK 0.2
+to 0.4 work against engine 0.2 or later, and older engines ignore the fields they do not know.
 
 ## 0.4.0 (2026-10-13)
 
@@ -90,7 +90,8 @@ Source-compatible with 0.2: every change adds a field, a method or a sentinel.
   `WithRequestID` gives one; errors carry it even when the engine never answered.
 - **Abandonment.** `RecommendWithFallback` reports `POST
   /recommendations/{id}/abandon` in the background on a timeout, network error, 5xx or
-  unreadable answer, so the engine flags the impression `client_fallback`.
+  unreadable answer, so the engine flags the impression `client_abandoned` with the reason
+  `client_fallback`.
   `Recommendation.RequestID` and `Recommendation.Abandoned` say what happened. `Abandon` and
   `AbandonSync` let the app report a slate it received but did not show. Not sent when the breaker
   was open (nothing reached the engine) or the engine refused the request (4xx).

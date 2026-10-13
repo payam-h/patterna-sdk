@@ -1,11 +1,10 @@
 # Changelog: patterna-sdk
 
-SDK 0.2 to 0.4 need engine 0.2 or later (the engine in production since release `7a7683e`).
-
-Published as `patterna-sdk` from [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk)
-(`typescript/`). The npm publish is pending: `npm install patterna-sdk` returns 404 today. Until
-then build it from that repository at tag `v0.4.0` (`npm ci && npm run build && npm pack` in
-`typescript/`) and install the tarball.
+Current release: 0.4.0, published on npm as `patterna-sdk` (`npm install patterna-sdk@0.4.0`) from
+[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) (`typescript/`). The production
+engine reports `engine_version: 0.3.1` (the contract version) and every field below is live on it;
+SDK 0.2 to 0.4 work against engine 0.2 or later, and older engines ignore the fields they do not
+know.
 
 ## 0.4.0 (2026-10-13)
 
@@ -41,7 +40,7 @@ with 0.3. The shared signing and assignment-unit vectors are unchanged.
 
 ## 0.3.0 (2026-10-13)
 
-Needs engine 0.3 (`engine_version` 0.2.0) for the new fields; older engines ignore them.
+Needs engine 0.3 or later for the new fields (that release reported `engine_version` 0.2.0; production is on 0.3.1 now); older engines ignore them.
 
 ### Added
 

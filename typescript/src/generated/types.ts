@@ -26,8 +26,9 @@ export interface paths {
          *     `POST /recommendations/{request_id}/abandon`, so the fallback rate and the ledger see it.
          *
          *     Errors that are not fallbacks (fix the request): 400 (`unknown_region`: context.region is
-         *     not one of the tenant's regions), 404 `unknown_surface`, 422 `mode_conflict`. Errors
-         *     where the caller shows its own list: 409 `surface_off`, 422 `no_candidates` (nothing left
+         *     not one of the tenant's regions), 422 `mode_conflict`. 404 `unknown_surface` is a
+         *     configuration bug: the SDKs show your own list for it and expose the cause, so alert on
+         *     it. Errors where the caller shows its own list: 409 `surface_off`, 422 `no_candidates` (nothing left
          *     after the filters and the surface's fallback list is empty too), 429 (`rate_limited`, or
          *     `quota_exceeded`: the plan's monthly serve requests are used; details carry `quota`,
          *     `used` and `resets_at`, the 1st of next month UTC), 5xx.
@@ -2385,10 +2386,154 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/proof/attribution": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Which generator earned the lift, per ISO week (the jobs' generator_attribution)
+         * @description Per week and generator: the share of slots and taps it won, and the SNIPS (and doubly
+         *     robust) tap rate the surface would have had without it, from explored slates. Descriptive;
+         *     the ledger stays the proof. The example set has none: include_synthetic answers no rows.
+         */
+        get: operations["generatorAttribution"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audiences/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Time-of-day and format profiles per persona (aggregates only, never a user row)
+         * @description Per persona: the share of its users whose learned active time buckets
+         *     (users.attributes.active_buckets) include each bucket, and the persona's mean learned format
+         *     preference (users.attributes.format_pref). Personas under min_users are only counted in
+         *     `suppressed`. Plus the tenant's tap rate per time bucket summed over item_time_profile.
+         */
+        get: operations["audienceProfiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/catalog/copurchase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The stored product co-purchase aggregate and its strongest pairs */
+        get: operations["getCopurchase"];
+        put?: never;
+        /**
+         * Replace the co-purchase aggregate from an orders export reduced in the browser (editors)
+         * @description The panel reads the shop's orders export in the browser and sends the line-item name and SKU
+         *     only, grouped by order, without the order's name: `line_items` holds each distinct
+         *     (name, sku) once and `orders` lists indexes into it. No customer field is accepted (unknown
+         *     fields are a 400). Matching and the aggregate are the jobs' orders-csv rules: SKU first, then
+         *     title, then the title before " - "; pairs with at least min_orders co-orders and their lift.
+         *     Writes product_copurchase and a connector_runs row (source orders_csv); audited.
+         */
+        post: operations["postCopurchase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/catalog/items/{external_id}/label": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * The panel's own label for an item without an editorial title (editors; audited)
+         * @description A member community's name is user text and is never imported, so editors give it a label of
+         *     their own. Stored as `attributes.editor_label`, kept across imports; "" removes it. At most
+         *     80 characters on one line, no email address.
+         */
+        put: operations["setEditorLabel"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        Attribution: {
+            surface?: string;
+            weeks?: number;
+            rows?: {
+                /** Format: date */
+                week_start?: string;
+                generator?: string;
+                slates?: number;
+                taps?: number;
+                tap_share?: number;
+                slots?: number;
+                slot_share?: number;
+                explored_slates?: number;
+                logged_rate?: number | null;
+                /** @description SNIPS tap rate with this generator's contributions removed */
+                without_rate?: number | null;
+                without_ci_low?: number | null;
+                without_ci_high?: number | null;
+                without_ess?: number | null;
+                /** @description doubly robust estimate of the same */
+                without_dr?: number | null;
+                version?: string;
+            }[];
+        };
+        AudienceProfiles: {
+            min_users?: number;
+            /** @description users in personas under min_users */
+            suppressed?: number;
+            personas?: {
+                persona?: string;
+                users?: number;
+                with_time?: number;
+                with_format?: number;
+                buckets?: {
+                    key?: string;
+                    users?: number;
+                    share?: number;
+                }[];
+                formats?: {
+                    key?: string;
+                    share?: number;
+                }[];
+            }[];
+            buckets?: {
+                /** @enum {string} */
+                bucket?: "weekday_morning" | "weekday_day" | "weekday_evening" | "weekday_night" | "weekend_morning" | "weekend_day" | "weekend_evening" | "weekend_night";
+                taps?: number;
+                impressions?: number;
+                rate?: number | null;
+            }[];
+        };
         Error: {
             /** @description stable machine code; the full list is in the API description */
             code: string;
@@ -2416,11 +2561,11 @@ export interface components {
                 /** @enum {string} */
                 platform?: "ios" | "android" | "web";
                 hour_bucket?: number;
-                /** @description 0 = Monday, from the device clock; derived from the request time in the tenant's timezone when absent. With hour_bucket it selects one of eight time buckets for the time_fit generator (docs/SIGNALS.md). */
+                /** @description 0 = Monday, from the device clock; when absent the engine derives it from its own clock in UTC, so send it. With hour_bucket it selects one of eight time buckets for the time_fit generator (docs/SIGNALS.md). */
                 weekday?: number;
                 /** @description free, premium or a tenant-defined tier. For free the premium policy applies and an item that showed this user a paywall in the last 7 days is left out. A ranker feature; never stored on the user. */
                 subscription_tier?: string;
-                /** @description days since the account was created, bucketed by the engine to new (<7), settled (<90) and long. A ranker feature only. */
+                /** @description days since the account was created, bucketed by the engine to new (<7), settled (<90) and long and logged with the impression as that bucket; not a ranker feature yet (the gbdt ranker reads hour, weekend and platform from the context, not tenure). Never stored on the user. */
                 tenure_days?: number;
                 /** @description the item the user is on (an article, a community). Resolved against the whole catalog, any kind: an article can anchor a product list (reason pairs_with). */
                 anchor_item_id?: string;
@@ -2433,7 +2578,7 @@ export interface components {
                 measured?: boolean;
                 /** @description the customer's own editorial list for this page (an article's pairs-with products, the editor's related articles). In the control arm it is the slate, in this order, under the request's rules (never the anchor, excluded ids, joined communities, other kinds; the premium policy), logged with control_source request; newest items fill the rest. In treatment it is the list short slates are filled from. */
                 control_item_ids?: string[];
-                /** @description community ids the user is in, for requests without an identity (non_profiled): never offered. In personalized and cohort mode membership also comes from community_joined/community_left events. */
+                /** @description community ids the user is in: never offered, in every mode. In non_profiled it is the only source; in personalized and cohort mode it is merged with the memberships Patterna already knows from community_joined/community_left events. Used for this request only, never stored. */
                 member_of?: string[];
                 /** @description coarse per-request context: one of the regions the tenant configured (Settings regions; anything else is 400 unknown_region). Items of the same region score up by the flow's filters.region_boost; other items are never hidden. Stored only with the impression, never on the user. A region, never a location: no coordinates, no address, no postcode. */
                 region?: string;
@@ -2514,7 +2659,7 @@ export interface components {
         };
         Interaction: {
             item_id: string;
-            /** @description ignored: the kind comes from the logged slate */
+            /** @description ignored: the kind comes from the logged slate (send it anyway for your own logs; the Go SDK checks it locally for non-document items when it did not serve the slate itself) */
             kind?: string;
             /** @description the slot Patterna served (0-based); the engine records the served slot from its log */
             position: number;
@@ -2524,8 +2669,11 @@ export interface components {
             block?: string;
             /** @enum {string} */
             type: "seen" | "click" | "dismiss";
-            /** Format: date-time */
-            occurred_at: string;
+            /**
+             * Format: date-time
+             * @description when it happened on the device; when absent the engine stores the time it received the report
+             */
+            occurred_at?: string;
         };
         Event: {
             event_id: string;
@@ -2575,7 +2723,7 @@ export interface components {
             premium?: boolean;
             /** Format: date-time */
             published_at?: string;
-            /** @description editorial attributes. The engine reads (docs/SIGNALS.md): format (text|video|audio|recipe|workout|tool|product), duration_min or reading_time_min, difficulty (easy|medium|hard), author, available or in_stock (products; false is never served), expires_at (RFC 3339; never served after), starts_at (events; never served after), repurchase_days (products), region (one of the tenant's regions), phase_fit[]. Kept for the panel: price_cents, compare_at_cents, currency, categories[], image_url, url, product_type. */
+            /** @description editorial attributes. The engine reads (docs/SIGNALS.md): format (text|video|audio|recipe|workout|tool|product), duration_min or reading_time_min, difficulty (easy|medium|hard), author, available or in_stock (products; false is never served), expires_at (RFC 3339; never served after), starts_at (events; never served after), repurchase_days (products), region (one of the tenant's regions), phase_fit[]. Kept for the panel: price_cents, compare_at_cents, currency, categories[], image_url, url, product_type, editor_label (the panel's own label for an untitled item such as a member community; an upsert without the key keeps the stored label). */
             attributes?: Record<string, unknown>;
             /** @description body text for enrichment; stored only as embedding and tags, never returned */
             text?: string;
@@ -2656,6 +2804,10 @@ export interface components {
             client_abandoned?: boolean;
             model_versions?: {
                 [key: string]: string;
+            } | null;
+            /** @description the coarse request context logged with the impression (impressions.context): locale, platform, hour_bucket, weekday, region, subscription_tier, tenure_days; null on slates logged before 0012 */
+            context?: {
+                [key: string]: unknown;
             } | null;
             slate?: {
                 item_id?: string;
@@ -3071,6 +3223,17 @@ export interface components {
             /** @description preview a draft version */
             flow_version?: number;
             slots?: number;
+            /** @description the page the slate is for (anchored placements: more to read, article products, related communities), as context.anchor_item_id on /recommendations */
+            anchor_item_id?: string;
+            /** @description the coarse request context to preview with (same rules as RecommendRequest.context) */
+            context?: {
+                hour_bucket?: number;
+                weekday?: number;
+                region?: string;
+                platform?: string;
+                subscription_tier?: string;
+                session_items?: string[];
+            };
         };
         UsersSummary: {
             window_days?: number;
@@ -3098,6 +3261,14 @@ export interface components {
             /** @description item id → the logged probability that the policy put this item in its slot */
             propensities?: {
                 [key: string]: number;
+            };
+            /** @description why slate.shown is what it is (preview only; never on /recommendations): items that passed the request's rules, those that also reached the relevance floor on an anchored request, against the surface's min_slots */
+            eligibility?: {
+                eligible_by_rules?: number;
+                eligible?: number;
+                min_slots?: number;
+                relevance_floor?: number;
+                anchored?: boolean;
             };
         };
         CuratedItem: {
@@ -3279,6 +3450,22 @@ export interface components {
             phase_tags?: boolean;
             /** @description the coarse regions context.region and item region may name */
             regions?: string[];
+            /** @description the tenant's plan and limits with this month's serve requests (key_usage, as the quota counts them); Settings warns at warn_share before 429 quota_exceeded */
+            plan?: {
+                /** @enum {string} */
+                name?: "trial" | "standard" | "enterprise";
+                /** @description null when the plan has no request quota */
+                request_quota_monthly?: number | null;
+                seats?: number | null;
+                requests_this_month?: number;
+                /** @example 0.9 */
+                warn_share?: number;
+                /**
+                 * Format: date-time
+                 * @description the first instant of next month, UTC
+                 */
+                resets_at?: string;
+            };
             /** Format: date-time */
             suspended_at?: string | null;
             paused?: boolean;
@@ -8235,6 +8422,177 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    generatorAttribution: {
+        parameters: {
+            query: {
+                surface: string;
+                weeks?: number;
+                /** @description true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both. */
+                include_synthetic?: components["parameters"]["IncludeSynthetic"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ok */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Attribution"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    audienceProfiles: {
+        parameters: {
+            query?: {
+                /** @description true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both. */
+                include_synthetic?: components["parameters"]["IncludeSynthetic"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ok */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudienceProfiles"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getCopurchase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ok */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        pairs?: number;
+                        version?: string | null;
+                        /** Format: date-time */
+                        computed_at?: string | null;
+                        top?: {
+                            item_a?: string;
+                            title_a?: string;
+                            item_b?: string;
+                            title_b?: string;
+                            orders?: number;
+                            lift?: number;
+                        }[];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    postCopurchase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    line_items: {
+                        name: string;
+                        sku?: string;
+                    }[];
+                    orders: number[][];
+                    /** @default 2 */
+                    min_orders?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description aggregate replaced */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        orders?: number;
+                        multi_product_orders?: number;
+                        pairs?: number;
+                        line_items?: number;
+                        line_items_matched?: number;
+                        unmatched_line_items?: {
+                            name?: string;
+                            count?: number;
+                        }[];
+                        version?: string;
+                        /** Format: date-time */
+                        computed_at?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    setEditorLabel: {
+        parameters: {
+            query?: {
+                kind?: string;
+            };
+            header?: never;
+            path: {
+                external_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    label: string;
+                };
+            };
+        };
+        responses: {
+            /** @description stored */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        external_id?: string;
+                        kind?: string;
+                        editor_label?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
         };

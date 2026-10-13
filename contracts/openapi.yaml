@@ -66,8 +66,9 @@ paths:
         `POST /recommendations/{request_id}/abandon`, so the fallback rate and the ledger see it.
 
         Errors that are not fallbacks (fix the request): 400 (`unknown_region`: context.region is
-        not one of the tenant's regions), 404 `unknown_surface`, 422 `mode_conflict`. Errors
-        where the caller shows its own list: 409 `surface_off`, 422 `no_candidates` (nothing left
+        not one of the tenant's regions), 422 `mode_conflict`. 404 `unknown_surface` is a
+        configuration bug: the SDKs show your own list for it and expose the cause, so alert on
+        it. Errors where the caller shows its own list: 409 `surface_off`, 422 `no_candidates` (nothing left
         after the filters and the surface's fallback list is empty too), 429 (`rate_limited`, or
         `quota_exceeded`: the plan's monthly serve requests are used; details carry `quota`,
         `used` and `resets_at`, the 1st of next month UTC), 5xx.
@@ -2981,6 +2982,169 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  # ---- panel round 5 (docs/PANEL_API.md, "Panel round 5") -------------------------------------
+  /proof/attribution:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Which generator earned the lift, per ISO week (the jobs' generator_attribution)
+      description: |
+        Per week and generator: the share of slots and taps it won, and the SNIPS (and doubly
+        robust) tap rate the surface would have had without it, from explored slates. Descriptive;
+        the ledger stays the proof. The example set has none: include_synthetic answers no rows.
+      operationId: generatorAttribution
+      parameters:
+        - { name: surface, in: query, required: true, schema: { type: string } }
+        - { name: weeks, in: query, schema: { type: integer, minimum: 1, maximum: 52, default: 8 } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attribution' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /audiences/profiles:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Time-of-day and format profiles per persona (aggregates only, never a user row)
+      description: |
+        Per persona: the share of its users whose learned active time buckets
+        (users.attributes.active_buckets) include each bucket, and the persona's mean learned format
+        preference (users.attributes.format_pref). Personas under min_users are only counted in
+        `suppressed`. Plus the tenant's tap rate per time bucket summed over item_time_profile.
+      operationId: audienceProfiles
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudienceProfiles' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /catalog/copurchase:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: The stored product co-purchase aggregate and its strongest pairs
+      operationId: getCopurchase
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pairs: { type: integer }
+                  version: { type: [string, 'null'] }
+                  computed_at: { type: [string, 'null'], format: date-time }
+                  top:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        item_a: { type: string }
+                        title_a: { type: string }
+                        item_b: { type: string }
+                        title_b: { type: string }
+                        orders: { type: integer }
+                        lift: { type: number }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Replace the co-purchase aggregate from an orders export reduced in the browser (editors)
+      description: |
+        The panel reads the shop's orders export in the browser and sends the line-item name and SKU
+        only, grouped by order, without the order's name: `line_items` holds each distinct
+        (name, sku) once and `orders` lists indexes into it. No customer field is accepted (unknown
+        fields are a 400). Matching and the aggregate are the jobs' orders-csv rules: SKU first, then
+        title, then the title before " - "; pairs with at least min_orders co-orders and their lift.
+        Writes product_copurchase and a connector_runs row (source orders_csv); audited.
+      operationId: postCopurchase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [line_items, orders]
+              additionalProperties: false
+              properties:
+                line_items:
+                  type: array
+                  maxItems: 20000
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [name]
+                    properties:
+                      name: { type: string }
+                      sku: { type: string }
+                orders: { type: array, maxItems: 200000, items: { type: array, items: { type: integer, minimum: 0 } } }
+                min_orders: { type: integer, minimum: 1, default: 2 }
+      responses:
+        '200':
+          description: aggregate replaced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders: { type: integer }
+                  multi_product_orders: { type: integer }
+                  pairs: { type: integer }
+                  line_items: { type: integer }
+                  line_items_matched: { type: integer }
+                  unmatched_line_items: { type: array, items: { type: object, properties: { name: { type: string }, count: { type: integer } } } }
+                  version: { type: string }
+                  computed_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /catalog/items/{external_id}/label:
+    put:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: The panel's own label for an item without an editorial title (editors; audited)
+      description: |
+        A member community's name is user text and is never imported, so editors give it a label of
+        their own. Stored as `attributes.editor_label`, kept across imports; "" removes it. At most
+        80 characters on one line, no email address.
+      operationId: setEditorLabel
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, default: document } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              additionalProperties: false
+              properties:
+                label: { type: string, maxLength: 80 }
+      responses:
+        '200':
+          description: stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  external_id: { type: string }
+                  kind: { type: string }
+                  editor_label: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
 components:
   securitySchemes:
     apiKey:
@@ -3081,6 +3245,56 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
+    Attribution:
+      type: object
+      properties:
+        surface: { type: string }
+        weeks: { type: integer }
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              week_start: { type: string, format: date }
+              generator: { type: string }
+              slates: { type: integer }
+              taps: { type: integer }
+              tap_share: { type: number }
+              slots: { type: integer }
+              slot_share: { type: number }
+              explored_slates: { type: integer }
+              logged_rate: { type: [number, 'null'] }
+              without_rate: { type: [number, 'null'], description: SNIPS tap rate with this generator's contributions removed }
+              without_ci_low: { type: [number, 'null'] }
+              without_ci_high: { type: [number, 'null'] }
+              without_ess: { type: [number, 'null'] }
+              without_dr: { type: [number, 'null'], description: doubly robust estimate of the same }
+              version: { type: string }
+    AudienceProfiles:
+      type: object
+      properties:
+        min_users: { type: integer }
+        suppressed: { type: integer, description: users in personas under min_users }
+        personas:
+          type: array
+          items:
+            type: object
+            properties:
+              persona: { type: string }
+              users: { type: integer }
+              with_time: { type: integer }
+              with_format: { type: integer }
+              buckets: { type: array, items: { type: object, properties: { key: { type: string }, users: { type: integer }, share: { type: number } } } }
+              formats: { type: array, items: { type: object, properties: { key: { type: string }, share: { type: number } } } }
+        buckets:
+          type: array
+          items:
+            type: object
+            properties:
+              bucket: { type: string, enum: [weekday_morning, weekday_day, weekday_evening, weekday_night, weekend_morning, weekend_day, weekend_evening, weekend_night] }
+              taps: { type: integer }
+              impressions: { type: integer }
+              rate: { type: [number, 'null'] }
     Error:
       type: object
       required: [code, message, request_id]
@@ -3110,15 +3324,15 @@ components:
             app_version: { type: string }
             platform: { type: string, enum: [ios, android, web] }
             hour_bucket: { type: integer, minimum: 0, maximum: 23 }
-            weekday: { type: integer, minimum: 0, maximum: 6, description: "0 = Monday, from the device clock; derived from the request time in the tenant's timezone when absent. With hour_bucket it selects one of eight time buckets for the time_fit generator (docs/SIGNALS.md)." }
+            weekday: { type: integer, minimum: 0, maximum: 6, description: "0 = Monday, from the device clock; when absent the engine derives it from its own clock in UTC, so send it. With hour_bucket it selects one of eight time buckets for the time_fit generator (docs/SIGNALS.md)." }
             subscription_tier: { type: string, maxLength: 32, description: "free, premium or a tenant-defined tier. For free the premium policy applies and an item that showed this user a paywall in the last 7 days is left out. A ranker feature; never stored on the user." }
-            tenure_days: { type: integer, minimum: 0, description: "days since the account was created, bucketed by the engine to new (<7), settled (<90) and long. A ranker feature only." }
+            tenure_days: { type: integer, minimum: 0, description: "days since the account was created, bucketed by the engine to new (<7), settled (<90) and long and logged with the impression as that bucket; not a ranker feature yet (the gbdt ranker reads hour, weekend and platform from the context, not tenure). Never stored on the user." }
             anchor_item_id: { type: string, description: "the item the user is on (an article, a community). Resolved against the whole catalog, any kind: an article can anchor a product list (reason pairs_with)." }
             premium: { type: boolean }
             candidate_kinds: { type: array, items: { type: string } }
             measured: { type: boolean, default: true, description: "false when the user did not allow usage analytics. The slate is served and logged with exact propensities, but it stays out of the ledger, the power calculation and all learning in both arms; the app reports no interactions for it. Consent is decided before the list is drawn, so leaving these slates out of both arms keeps the comparison unbiased." }
             control_item_ids: { type: array, maxItems: 50, items: { type: string }, description: "the customer's own editorial list for this page (an article's pairs-with products, the editor's related articles). In the control arm it is the slate, in this order, under the request's rules (never the anchor, excluded ids, joined communities, other kinds; the premium policy), logged with control_source request; newest items fill the rest. In treatment it is the list short slates are filled from." }
-            member_of: { type: array, maxItems: 500, items: { type: string }, description: "community ids the user is in, for requests without an identity (non_profiled): never offered. In personalized and cohort mode membership also comes from community_joined/community_left events." }
+            member_of: { type: array, maxItems: 500, items: { type: string }, description: "community ids the user is in: never offered, in every mode. In non_profiled it is the only source; in personalized and cohort mode it is merged with the memberships Patterna already knows from community_joined/community_left events. Used for this request only, never stored." }
             region: { type: string, maxLength: 64, description: "coarse per-request context: one of the regions the tenant configured (Settings regions; anything else is 400 unknown_region). Items of the same region score up by the flow's filters.region_boost; other items are never hidden. Stored only with the impression, never on the user. A region, never a location: no coordinates, no address, no postcode." }
             session_items: { type: array, maxItems: 20, items: { type: string, maxLength: 200 }, description: "item ids this session just looked at, most recent first, for the session_items generator. Merged ahead of what the session reported through /interactions (seen and tapped slate items) and its engaged views (item_engaged events with the session id) in the last day. Session context only: works in every mode and never touches a user row." }
         slots: { type: integer, minimum: 1, maximum: 50 }
@@ -3184,15 +3398,15 @@ components:
 
     Interaction:
       type: object
-      required: [item_id, position, type, occurred_at]
+      required: [item_id, position, type]
       properties:
         item_id: { type: string }
-        kind: { type: string, description: "ignored: the kind comes from the logged slate" }
+        kind: { type: string, description: "ignored: the kind comes from the logged slate (send it anyway for your own logs; the Go SDK checks it locally for non-document items when it did not serve the slate itself)" }
         position: { type: integer, minimum: 0, description: "the slot Patterna served (0-based); the engine records the served slot from its log" }
         displayed_position: { type: integer, minimum: 0, description: "where the app showed it (0-based), when it re-sorted on the device; required on a device_resort surface" }
         block: { type: string, maxLength: 32, description: "which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace. A seen with a block records the block on the impression (per-block ledger rows)." }
         type: { type: string, enum: [seen, click, dismiss] }
-        occurred_at: { type: string, format: date-time }
+        occurred_at: { type: string, format: date-time, description: "when it happened on the device; when absent the engine stores the time it received the report" }
 
     Event:
       type: object
@@ -3235,7 +3449,7 @@ components:
         status: { type: string, enum: [draft, scheduled, published, archived], default: published }
         premium: { type: boolean, default: false }
         published_at: { type: string, format: date-time }
-        attributes: { type: object, description: "editorial attributes. The engine reads (docs/SIGNALS.md): format (text|video|audio|recipe|workout|tool|product), duration_min or reading_time_min, difficulty (easy|medium|hard), author, available or in_stock (products; false is never served), expires_at (RFC 3339; never served after), starts_at (events; never served after), repurchase_days (products), region (one of the tenant's regions), phase_fit[]. Kept for the panel: price_cents, compare_at_cents, currency, categories[], image_url, url, product_type." }
+        attributes: { type: object, description: "editorial attributes. The engine reads (docs/SIGNALS.md): format (text|video|audio|recipe|workout|tool|product), duration_min or reading_time_min, difficulty (easy|medium|hard), author, available or in_stock (products; false is never served), expires_at (RFC 3339; never served after), starts_at (events; never served after), repurchase_days (products), region (one of the tenant's regions), phase_fit[]. Kept for the panel: price_cents, compare_at_cents, currency, categories[], image_url, url, product_type, editor_label (the panel's own label for an untitled item such as a member community; an upsert without the key keeps the stored label)." }
         text: { type: string, description: "body text for enrichment; stored only as embedding and tags, never returned" }
         region: { type: string, maxLength: 64, description: "the coarse region the item belongs to; must be one of the tenant's regions (Settings), else 400 unknown_region. Requests from that region rank the item up by the flow's region_boost." }
         tags:
@@ -3314,6 +3528,10 @@ components:
         not_shown: { type: boolean }
         client_abandoned: { type: boolean }
         model_versions: { type: [object, 'null'], additionalProperties: { type: string } }
+        context:
+          type: [object, 'null']
+          description: "the coarse request context logged with the impression (impressions.context): locale, platform, hour_bucket, weekday, region, subscription_tier, tenure_days; null on slates logged before 0012"
+          additionalProperties: true
         slate:
           type: array
           items:
@@ -3649,6 +3867,18 @@ components:
         locale: { type: string, default: nl }
         flow_version: { type: integer, description: preview a draft version }
         slots: { type: integer }
+        anchor_item_id: { type: string, description: "the page the slate is for (anchored placements: more to read, article products, related communities), as context.anchor_item_id on /recommendations" }
+        context:
+          type: object
+          additionalProperties: false
+          description: the coarse request context to preview with (same rules as RecommendRequest.context)
+          properties:
+            hour_bucket: { type: integer, minimum: 0, maximum: 23 }
+            weekday: { type: integer, minimum: 0, maximum: 6 }
+            region: { type: string }
+            platform: { type: string }
+            subscription_tier: { type: string }
+            session_items: { type: array, maxItems: 20, items: { type: string } }
 
     UsersSummary:
       type: object
@@ -3676,6 +3906,15 @@ components:
           type: object
           description: item id → the logged probability that the policy put this item in its slot
           additionalProperties: { type: number }
+        eligibility:
+          type: object
+          description: "why slate.shown is what it is (preview only; never on /recommendations): items that passed the request's rules, those that also reached the relevance floor on an anchored request, against the surface's min_slots"
+          properties:
+            eligible_by_rules: { type: integer }
+            eligible: { type: integer }
+            min_slots: { type: integer }
+            relevance_floor: { type: number }
+            anchored: { type: boolean }
 
     CuratedItem:
       type: object
@@ -3846,6 +4085,16 @@ components:
         two_person_rule: { type: boolean }
         phase_tags: { type: boolean, description: "serve phase_fit item metadata in slates (off by default)" }
         regions: { type: array, items: { type: string }, description: "the coarse regions context.region and item region may name" }
+        plan:
+          type: object
+          description: "the tenant's plan and limits with this month's serve requests (key_usage, as the quota counts them); Settings warns at warn_share before 429 quota_exceeded"
+          properties:
+            name: { type: string, enum: [trial, standard, enterprise] }
+            request_quota_monthly: { type: [integer, 'null'], description: null when the plan has no request quota }
+            seats: { type: [integer, 'null'] }
+            requests_this_month: { type: integer }
+            warn_share: { type: number, example: 0.9 }
+            resets_at: { type: string, format: date-time, description: "the first instant of next month, UTC" }
         suspended_at: { type: [string, 'null'], format: date-time }
         paused: { type: boolean }
         deletion_scheduled_for: { type: [string, 'null'], format: date-time, description: set by POST /settings/delete-workspace }

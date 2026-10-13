@@ -1,20 +1,18 @@
 # patterna-sdk (Python)
 
-Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 additions need engine 0.3
-(API 0.2.0), which is the engine in production; the 0.4 additions (request context, editorial
-attributes, activity events, the new flow generators and filters) take effect with engine round 5
-(API 0.3.0) and are ignored before it.
+Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+version), and every field in this release is live on it. Works against engine 0.2 or later;
+older engines ignore the fields they do not know.
 
 Python client for the Patterna API, with the same shape as `patterna-sdk` (TypeScript) and the
 Go SDK: serve, ingest and admin calls, a consent gate, typed errors, one retry on idempotent
 calls, client-minted request ids with abandonment, and event signatures and assignment units that
 share test vectors across the three SDKs. No dependencies: `urllib` and `hmac` only. Python 3.10+.
 
-Not on PyPI. Install it from the public repository at tag `v0.4.0`:
+Not on PyPI (by decision). Install it from the public repository at tag `v0.4.0`:
 
 ```sh
 pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"
-# inside this monorepo: pip install -e packages/sdk-py
 ```
 
 ```python
@@ -125,7 +123,7 @@ For CI scripts that keep flow configs in your repository: `list_surfaces`, `get_
 date_to=, weekly=, by=, block=)`, `ledger_by_block`, `export_ledger`, `export_status`,
 `get_settings`, `update_settings(phase_tags=)`, `set_phase_tags`, `health`,
 `create_signing_secret`, `rotate_signing_secret`. `apply_flow` compares configs as canonical JSON; nothing happens when the
-active version matches. The Go SDK ships the same as a CLI (`packages/sdk-go/cmd/patterna`).
+active version matches. The Go SDK ships the same as a CLI (`patterna`, in the `go/` module).
 
 ## Engine 0.3
 
@@ -181,7 +179,7 @@ is replaced as a whole. `surface_metrics(key, days=, block=)` adds `not_shown_sh
 
 ## Engine round 5: context, editorial attributes, activity events
 
-Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+Everything the engine reads is listed at https://patterna.orven.am/docs/signals; these are the SDK's parts of it.
 
 ```python
 from patterna_sdk import TIER_FREE, time_context
@@ -282,7 +280,9 @@ canonical JSON of the event without `signature`, keyed with the UTF-8 bytes of t
 string exactly as the API returned it (never hex-decoded). The shared vector is `8baf7299…aac9`
 with key `test-signing-key`.
 
+In a checkout of `python/`:
+
 ```sh
-cd packages/sdk-py && python -m venv .venv && .venv/bin/pip install -e '.[dev]'
+python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest -q && .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy
 ```

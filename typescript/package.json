@@ -1,0 +1,61 @@
+{
+	"name": "patterna-sdk",
+	"version": "0.2.0",
+	"description": "Patterna client for backends, browsers and React Native: recommendations, interactions, events and catalog.",
+	"license": "MIT",
+	"type": "module",
+	"sideEffects": false,
+	"main": "./dist/index.cjs",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"build": "tsup",
+		"typecheck": "tsc --noEmit",
+		"lint": "eslint .",
+		"test": "vitest run",
+		"check": "npm run typecheck && npm run lint && npm run test && npm run build"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.39.0",
+		"@redocly/cli": "2.62.1",
+		"@types/node": "^22.18.0",
+		"eslint": "^9.39.0",
+		"openapi-typescript": "7.13.0",
+		"tsup": "^8.5.0",
+		"typescript": "^5.9.3",
+		"typescript-eslint": "^8.46.0",
+		"vitest": "^3.2.4"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/payam-h/patterna-sdk.git",
+		"directory": "typescript"
+	},
+	"homepage": "https://patterna.orven.am/docs",
+	"bugs": {
+		"url": "https://github.com/payam-h/patterna-sdk/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}

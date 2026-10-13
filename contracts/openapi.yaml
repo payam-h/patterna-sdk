@@ -1,0 +1,4444 @@
+openapi: 3.1.0
+info:
+  title: Patterna API
+  version: 0.1.0
+  description: |
+    Proof-first recommendation platform. Three key scopes: `serve` (recommendations and
+    interactions; keys start `pk_s_`), `ingest` (events, catalog, user consent, profile and
+    deletion; `pk_i_`), `admin` (tenant configuration, proof, exports; `pk_a_`). A key of a higher
+    scope passes a lower one (admin > ingest, serve). Every request carries
+    `Authorization: Bearer <key>` (the two webhooks authenticate themselves instead); the tenant is
+    derived from the key, never from the body. Every response carries `X-Request-Id`; send your
+    own (at most 64 characters) to correlate, and on `POST /recommendations` it becomes the slate's
+    request id. Browsers may send `X-Request-Id`, `X-Trace-Id`, `X-Deadline-Ms` and
+    `X-Patterna-Tester` cross-origin (CORS).
+
+    Conventions:
+    - JSON bodies are strict: an unknown field is a 400 `bad_request`.
+    - Positions start at 0: `items[0]` has `position: 0`.
+    - Deletion (`DELETE /users/{id}`) is immediate: rows are deleted or unlinked in the request;
+      only model retraining follows later (`models_retrained_at`).
+
+    Error codes (`Error.code`), by status:
+    - 400: `bad_request`, `invalid_reason_template`, `metric_not_applicable`
+    - 401: `unauthorized`, `wrong_scope`, `bad_credentials`, `bad_mfa`, `mfa_pending`, `bad_signature`, `webhook_not_configured`
+    - 403: `forbidden`, `forbidden_role`, `forbidden_scope`, `staff_only`, `session_required`, `same_person`, `mfa_enrolment_required`
+    - 404: `not_found`, `unknown_surface`, `unknown_request`, `unknown_flow_version`, `item_not_found`
+    - 409: `surface_off`, `experiment_running`, `signing_secret_exists`, `exists`, `approval_required`, `approval_pending`, `approval_decided`, `no_endpoints`, `deletion_scheduled`, `export_not_ready`, `last_owner`, `already_member`, `seat_limit`, `mfa_enforced`
+    - 422: `mode_conflict`, `no_candidates`, `unknown_item`, `displayed_position_required`, `pii_rejected` (catalog attributes), `bad_tester_id`, `bad_webhook_url`, `bad_slack_webhook`, `unknown_parent`, `parent_cycle`
+    - 429: `rate_limited`, `account_locked`, `too_many_attempts`
+    - 500: `internal` (with the request id)
+    Per-event codes in `POST /events` → `rejected[].code`: `invalid_event`, `pii_rejected`,
+    `invalid_signature`, `no_signing_secret`, `unknown_request`, `unknown_item`,
+    `displayed_position_required`.
+servers:
+  - url: https://patterna-api.orven.am/v1
+    description: production (EU)
+  - url: http://localhost:5300/v1
+    description: local
+security:
+  - apiKey: []
+tags:
+  - { name: serve, description: recommendations and the interaction loop }
+  - { name: ingest, description: canonical events in }
+  - { name: catalog, description: "items, products, communities and their tags" }
+  - { name: proof, description: "holdout, ledger, replay" }
+  - { name: admin, description: "surfaces, flows, keys, users, exports" }
+  - { name: operator, description: "the operator area (/admin): Ainur staff sessions only" }
+  - { name: accounts, description: "sign-in, MFA, passwords, invites, people and sessions (docs/ACCOUNTS_API.md)" }
+
+paths:
+  /recommendations:
+    post:
+      tags: [serve]
+      summary: Rank a slate for a surface
+      operationId: recommend
+      description: |
+        Returns a slate of items with a reason key per slot and the request id the caller must
+        echo back in `/interactions`. The impression is logged with per-position propensities.
+        In `non_profiled` mode `user_id` must be absent (422 `mode_conflict`).
+
+        Timeouts: the engine answers within its budget (`SERVE_BUDGET`, default 120 ms, below the
+        SDKs' 150 ms) or within the client's deadline (`X-Deadline-Ms` or `deadline_ms`, minus a
+        tenth for the network), whichever is shorter; past it, it answers the surface's
+        non-personalized list with `fallback: true`. A client that gave up anyway reports it with
+        `POST /recommendations/{request_id}/abandon`, so the fallback rate and the ledger see it.
+
+        Errors that are not fallbacks (fix the request): 400, 404 `unknown_surface`, 422
+        `mode_conflict`. Errors where the caller shows its own list: 409 `surface_off`, 422
+        `no_candidates` (nothing left after the filters), 429, 5xx.
+      parameters:
+        - { name: X-Deadline-Ms, in: header, schema: { type: integer, minimum: 10, maximum: 10000 }, description: "the client's own deadline in milliseconds; the engine answers before it" }
+        - { name: X-Request-Id, in: header, schema: { type: string, maxLength: 64 }, description: "a client-minted id (at most 64 characters) becomes the slate's request id, so the client can abandon a slate whose answer never arrived; without it the engine mints one" }
+        - { name: X-Patterna-Tester, in: header, schema: { type: string, enum: ['1'] }, description: "from the customer's backend: this user is on the customer's tester roster. A surface in `testers` status serves the ranked list to the request (counted in `tester_requests_7d` and audited once a day per surface). Patterna ids never need to be known." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecommendRequest' }
+      responses:
+        '200':
+          description: a slate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Slate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /recommendations/{request_id}/abandon:
+    post:
+      tags: [serve]
+      summary: The client gave up on this slate and showed its own list
+      operationId: abandonRecommendation
+      description: |
+        Flags the impression `fallback: true, client_abandoned: true`. It counts in the fallback
+        rate and stays in its arm in the ledger (intention to treat: dropping it would flatter the
+        slower arm). Idempotent. Call it when the client's deadline passed, or when the app hid
+        the block for its own reasons.
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, enum: [timeout, server_error, network_error, bad_response, client_fallback], description: why the client gave up; stored with the impression }
+      responses:
+        '200':
+          description: flagged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  arm: { type: string, enum: [control, treatment, none] }
+                  fallback: { type: boolean }
+                  client_abandoned: { type: boolean }
+                  reason: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /interactions:
+    post:
+      tags: [serve]
+      summary: Report seen, click, dismiss by request id
+      operationId: reportInteractions
+      description: |
+        Every `item_id` must be in the slate served for `request_id` (422 `unknown_item` with
+        `details.unknown_item_ids`). The item's kind and served position come from the logged
+        slate; a client `kind` is ignored. On a surface with `device_resort` every interaction must
+        carry `displayed_position` (422 `displayed_position_required`). Report only for users who
+        allowed usage analytics; the others are requested with `context.measured: false`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, interactions]
+              properties:
+                request_id: { type: string }
+                interactions:
+                  type: array
+                  maxItems: 50
+                  items: { $ref: '#/components/schemas/Interaction' }
+      responses:
+        '202': { description: accepted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /events:
+    post:
+      tags: [ingest]
+      summary: Ingest canonical events (batch)
+      operationId: ingestEvents
+      description: |
+        Up to 500 events per call, idempotent on `event_id`. Events sent with an ingest or admin
+        key are marked `signed`. Any event that carries a `signature` is verified against the
+        tenant's signing secret (the string `POST /settings/signing-secret` returned, used as the
+        HMAC key byte for byte); a wrong signature rejects the event (`invalid_signature`), a
+        tenant without a secret rejects it (`no_signing_secret`). There is no separate SDK scope:
+        sign on your backend.
+
+        Each event is judged on its own and the call answers 202:
+        - personal data (a PII field name such as `email` or `name` in props or context, or an
+          email or `provider|id` as `user_id`) rejects the event with `pii_rejected` and the
+          offending field paths in `fields`; nothing of it is stored;
+        - a field that is not in the type's allowlist and is not PII is dropped and counted in
+          `dropped_fields`;
+        - `rec_*` events with a `request_id` follow the `/interactions` rules (`unknown_item`,
+          `displayed_position_required`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/Event' }
+      responses:
+        '202':
+          description: accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer }
+                  duplicates: { type: integer }
+                  pii_rejected: { type: integer, description: events refused for personal data }
+                  dropped_fields: { type: object, additionalProperties: { type: integer }, description: "dropped non-PII keys per <type>.<field> or context.<field>" }
+                  rejected:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_id, reason, code]
+                      properties:
+                        event_id: { type: string }
+                        reason: { type: string }
+                        code: { type: string, enum: [invalid_event, pii_rejected, invalid_signature, no_signing_secret, unknown_request, unknown_item, displayed_position_required] }
+                        fields: { type: array, items: { type: string }, description: "pii_rejected: the field paths (names only, never values)" }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /catalog/items:
+    put:
+      tags: [catalog]
+      summary: Upsert items (batch)
+      operationId: upsertItems
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/ItemUpsert' }
+      responses:
+        '200':
+          description: upserted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upserted: { type: integer }
+                  enrichment_queued: { type: integer }
+    get:
+      tags: [catalog]
+      summary: List items, or the items changed since a point in time
+      operationId: listItems
+      description: |
+        With `changed_since` the page holds every item created or changed at or after that instant
+        (archived included), for a nightly reconcile; page with `cursor` as usual. Deleted items
+        (`DELETE /catalog/items/{external_id}`) no longer appear.
+      parameters:
+        - { name: changed_since, in: query, schema: { type: string, format: date-time }, description: RFC 3339 }
+        - { name: kind, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200':
+          description: page of items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Item' } }
+                  next_cursor: { type: [string, 'null'] }
+
+  /catalog/items/{external_id}:
+    get:
+      tags: [catalog]
+      summary: Read one item
+      operationId: getItem
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, default: document } }
+      responses:
+        '200':
+          description: the item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Item' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [catalog]
+      summary: Delete an item for good (audited)
+      operationId: deleteItem
+      description: |
+        Removes the item, its tags and body text, and every reference the precompute tables and
+        curated lists hold (user shortlists, item neighbours, curated list entries). Logged slates
+        keep the id, so the ledger does not change after the fact. Archive instead
+        (`POST /catalog/items/{external_id}/status`) to keep it restorable. Ingest or admin key.
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, default: document } }
+      responses:
+        '200':
+          description: deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  external_id: { type: string }
+                  kind: { type: string }
+                  deleted: { type: boolean }
+                  tags_removed: { type: integer }
+                  references_removed: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /catalog/items/{external_id}/status:
+    post:
+      tags: [catalog]
+      summary: Change an item's status (archive, schedule, publish)
+      operationId: setItemStatus
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [draft, scheduled, published, archived] }
+                published_at: { type: string, format: date-time }
+      responses:
+        '200': { description: updated }
+
+  /catalog/items/{external_id}/tags:
+    put:
+      tags: [catalog]
+      summary: Set editor-approved tags for an item
+      operationId: setItemTags
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tags:
+                  type: array
+                  items:
+                    type: object
+                    required: [tag]
+                    properties:
+                      tag: { type: string }
+                      weight: { type: number, default: 1 }
+                      approved: { type: boolean, default: true }
+      responses:
+        '200': { description: updated }
+
+  /users/{user_id}/mode:
+    put:
+      tags: [ingest]
+      summary: Set a user's consent mode
+      operationId: setUserMode
+      description: |
+        Ingest key (the customer's backend owns consent) or admin key. Switching to
+        `non_profiled` deletes the user row at once, keeps a salted opt-out marker and queues model
+        retraining.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { $ref: '#/components/schemas/Mode' }
+      responses:
+        '200': { description: updated }
+
+  /users/{user_id}/profile:
+    put:
+      tags: [ingest]
+      summary: Set the user's declared attributes as tag affinities
+      operationId: setUserProfile
+      description: |
+        Ingest or admin key. Goals, activity, stress, wearable, premium flag. Never health values.
+        422 `mode_conflict` for a `non_profiled` user (or one who opted out) unless the body sets
+        the mode explicitly.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserProfile' }
+      responses:
+        '200': { description: updated }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /users/{user_id}:
+    delete:
+      tags: [ingest]
+      summary: Delete every row about a user (immediate) and schedule retraining
+      operationId: deleteUser
+      description: |
+        Ingest or admin key. Immediate: the user row, assignments, events and shortlist are deleted
+        and logged slates are unlinked (the salted `unit_hash` keeps the ledger stable) inside the
+        request; `rows_deleted_at` is set in the answer. Only the model retraining follows
+        (`models_retrained_at`, nightly). The request is recorded with a salted hash, not the id.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '202':
+          description: rows deleted; retraining queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletionRequest' }
+    get:
+      tags: [admin]
+      summary: Export every row about a user
+      operationId: exportUser
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: the user's data
+          content:
+            application/json:
+              schema: { type: object }
+
+  /users/{user_id}/trace:
+    get:
+      tags: [admin]
+      summary: Why did this user see what they saw (last N requests)
+      operationId: userTrace
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: traces
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Trace' }
+
+  /surfaces:
+    get:
+      tags: [admin]
+      summary: List surfaces with status and the active flow version
+      operationId: listSurfaces
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: surfaces
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Surface' } }
+    post:
+      tags: [admin]
+      summary: Create a surface
+      operationId: createSurface
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SurfaceInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Surface' }
+
+  /surfaces/{key}:
+    patch:
+      tags: [admin]
+      summary: Update a surface (status, slots, exploration share, fallback, testers, notes)
+      operationId: updateSurface
+      description: A status change notifies and enqueues `surface.status_changed`.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SurfaceInput' }
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Surface' }
+
+  /surfaces/{key}/flows:
+    get:
+      tags: [admin]
+      summary: Flow versions of a surface
+      operationId: listFlows
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: versions
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Flow' } }
+    post:
+      tags: [admin]
+      summary: Create a new flow version (not yet active)
+      operationId: createFlow
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { $ref: '#/components/schemas/FlowConfig' }
+                note: { type: string }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Flow' }
+
+  /surfaces/{key}/flows/{version}/activate:
+    post:
+      tags: [admin]
+      summary: Activate a flow version (audited; previous stays rollable)
+      operationId: activateFlow
+      description: |
+        Optional body `{note}`. On a live surface of a tenant with the two-person rule this answers
+        409 `approval_required`; request one with POST /approvals.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: activated }
+
+  /surfaces/{key}/simulate:
+    post:
+      tags: [proof]
+      summary: Replay a flow config on logged traffic (offline evaluation)
+      operationId: simulateFlow
+      description: |
+        Runs the given config on the last N days of impressions and returns SNIPS estimates of the
+        primary metric with effective sample size, plus the twin simulator's curve when the tenant
+        has one. Does not change anything.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { $ref: '#/components/schemas/FlowConfig' }
+                days: { type: integer, default: 14 }
+      responses:
+        '200':
+          description: estimates
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimulationResult' }
+
+  /experiments:
+    get:
+      tags: [proof]
+      summary: Experiments (holdouts) per surface
+      operationId: listExperiments
+      responses:
+        '200':
+          description: experiments
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Experiment' } }
+    post:
+      tags: [proof]
+      summary: Start a holdout on a surface
+      operationId: createExperiment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExperimentInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Experiment' }
+
+  /experiments/{id}/end:
+    post:
+      tags: [proof]
+      summary: End a running experiment
+      operationId: endExperiment
+      description: Sets `ended_at`; the ledger keeps reading the experiment's window `[started_at, ended_at)`.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /deletion-requests:
+    get:
+      tags: [admin]
+      summary: The tenant's deletion requests (newest 200)
+      operationId: listDeletionRequests
+      responses:
+        '200':
+          description: requests; `user_id` is `sha256:<salted hash>` for requests through DELETE /users/{id}
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/DeletionRequest' } }
+
+  /proof/exports/{id}:
+    get:
+      tags: [proof]
+      summary: Poll a proof export
+      operationId: exportStatus
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: the job
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  status: { type: string, enum: [running, done, failed] }
+                  uri: { type: [string, 'null'] }
+                  files: { type: array, items: { type: string } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /settings/signing-secret:
+    post:
+      tags: [admin]
+      summary: Create the tenant's first event signing secret (owners, staff, admin keys)
+      operationId: createSigningSecret
+      description: |
+        Returns the secret once. Sign events with exactly this string as the HMAC-SHA256 key (its
+        UTF-8 bytes; nothing to decode), as the SDKs do. 409 `signing_secret_exists` when one was
+        issued already: rotate it.
+      responses:
+        '200': { $ref: '#/components/responses/SigningSecret' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /settings/signing-secret/rotate:
+    post:
+      tags: [admin]
+      summary: Replace the signing secret (owners, staff, admin keys)
+      operationId: rotateSigningSecret
+      description: |
+        Returns the new secret once. Events signed with the old one stop verifying at once:
+        deploy the new secret to your backend, then rotate. Also creates a first secret.
+      responses:
+        '200': { $ref: '#/components/responses/SigningSecret' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /proof/ledger:
+    get:
+      tags: [proof]
+      summary: The proof ledger
+      operationId: ledger
+      description: |
+        Without `bucket`: one summary row per surface with the user-clustered interval. With
+        `bucket=week`: weekly rows per arm for the chart (Wilson intervals per impression, UTC weeks
+        from Monday; default the last 12 weeks).
+      parameters:
+        - { name: surface, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: bucket, in: query, schema: { type: string, enum: [week] } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ledger rows with intervals, or weekly rows when bucket=week
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { type: array, items: { $ref: '#/components/schemas/LedgerRow' } }
+                  - { type: array, items: { $ref: '#/components/schemas/LedgerWeek' } }
+
+  /proof/export:
+    post:
+      tags: [proof]
+      summary: Export impressions and interactions for a period so the ledger can be recomputed
+      operationId: exportProof
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from: { type: string, format: date }
+                to: { type: string, format: date }
+                surface: { type: string }
+      responses:
+        '202':
+          description: export job queued; a signed URL arrives on the job
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+
+  /connectors:
+    get:
+      tags: [admin]
+      summary: Connector status per source (last run, health, setup values)
+      operationId: listConnectors
+      responses:
+        '200':
+          description: connectors
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ConnectorRun' } }
+
+  /webhooks/posthog:
+    post:
+      tags: [ingest]
+      summary: PostHog destination endpoint (maps and drops per contracts/events.md)
+      operationId: posthogWebhook
+      description: |
+        Authenticated by the tenant's PostHog token in `X-Patterna-Token` (set it with
+        `PATCH /settings` `posthog_token`; Patterna stores only its SHA-256), not by an API key.
+        A distinct id is never stored raw: an id the importer minted (`u_` + 26 base32 characters)
+        is kept, anything else (an Auth0 subject, an email) is minted with the tenant's
+        `PATTERNA_ID_SECRET` exactly as the importer does, or dropped when no secret is set.
+      security: []
+      parameters:
+        - { name: X-Patterna-Token, in: header, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { description: one PostHog event or an array of events }
+      responses:
+        '202': { description: accepted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /webhooks/shopify/{tenant}:
+    post:
+      tags: [ingest]
+      summary: Shopify orders/create and products/update (authenticated by Shopify's HMAC only)
+      operationId: shopifyWebhook
+      description: |
+        Shopify cannot send an API key: the tenant slug is in the path and `X-Shopify-Hmac-Sha256`
+        (base64 HMAC-SHA256 of the raw body under the tenant's `shopify_webhook_secret`) is the
+        only authentication. Without a configured secret the endpoint refuses every call (401
+        `webhook_not_configured`); a wrong signature is 401 `bad_signature`.
+      security: []
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - { name: X-Shopify-Hmac-Sha256, in: header, required: true, schema: { type: string } }
+        - { name: X-Shopify-Topic, in: header, required: true, schema: { type: string } }
+      responses:
+        '202': { description: accepted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /keys:
+    get:
+      tags: [admin]
+      summary: List API keys (prefix only)
+      operationId: listKeys
+      responses:
+        '200':
+          description: keys
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ApiKey' } }
+    post:
+      tags: [admin]
+      summary: Create a key; the secret is returned once
+      operationId: createKey
+      description: |
+        Owner sessions and staff mint any scope. An admin key mints `ingest` and `serve` keys only
+        (`forbidden_scope`); editors and viewers cannot (`forbidden_role`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeyInput' }
+      responses:
+        '201': { $ref: '#/components/responses/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /keys/{id}:
+    delete:
+      tags: [admin]
+      summary: Revoke a key
+      operationId: revokeKey
+      description: Owners and staff; an admin key may revoke `ingest` and `serve` keys only.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /audit:
+    get:
+      tags: [admin]
+      summary: Audit log
+      operationId: audit
+      parameters:
+        - { name: action, in: query, schema: { type: string }, description: 'prefix match, e.g. flow.' }
+        - { name: actor, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: entries
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+
+  /overview:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Setup checklist, status strip and what changed
+      operationId: overview
+      description: |
+        The checklist is computed from real rows only; status and alerts follow `include_synthetic`.
+        Alerts: SRM below 0.001 (the ledger's check), fallback share above the tenant's threshold
+        (default 2%, surfaces with at least 50 slates in 7 days), and failing connector runs.
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Overview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /surfaces/{key}/metrics:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Daily metrics of a surface (UTC days, zero-filled)
+      operationId: surfaceMetrics
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 180, default: 28 } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SurfaceMetrics' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /surfaces/{key}/preview:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Render a slate through the serve path in shadow
+      operationId: previewSurface
+      description: |
+        Logged with `shadow = true` (never shown, no arm assignment). `flow_version` previews a draft
+        without activating it. Contributions are per item and generator, as in the trace.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreviewRequest' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Preview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /surfaces/{key}/curated:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Curated lists of a surface
+      operationId: listCurated
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/CuratedList' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Create a curated list (feeds the curated generator when the flow names no ids)
+      operationId: createCurated
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CuratedListInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CuratedList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /surfaces/{key}/curated/{id}:
+    put:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Replace a curated list
+      operationId: updateCurated
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CuratedListInput' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CuratedList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Delete a curated list
+      operationId: deleteCurated
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /stream/impressions:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: The newest 50 slates served after a timestamp (live stream)
+      operationId: streamImpressions
+      description: |
+        Polled every few seconds with the returned `cursor` as the next `since`. No user or session
+        ids: the stream shows traffic, the trace shows one user.
+      parameters:
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: surface, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImpressionStream' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /experiments/{id}/power:
+    get:
+      tags: [proof]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Readable sample and power curve
+      operationId: experimentPower
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: baseline, in: query, schema: { type: number } }
+        - { name: relative, in: query, schema: { type: number } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Power' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /taxonomy:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Managed tags plus tags in use
+      operationId: getTaxonomy
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/TaxonomyTag' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Replace the taxonomy (audited with the diff)
+      operationId: putTaxonomy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [tags], properties: { tags: { type: array, items: { $ref: '#/components/schemas/TaxonomyTagInput' } } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/TaxonomyTag' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /catalog/items/{external_id}/similar:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Similar items (embedding cosine when present, else tag cosine)
+      operationId: similarItems
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string } }
+        - { name: n, in: query, schema: { type: integer, default: 8, maximum: 50 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SimilarItem' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /catalog/items/{external_id}/stats:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: How an item was served and tapped
+      operationId: itemStats
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+        - { name: days, in: query, schema: { type: integer, default: 28, maximum: 365 } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ItemStats' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /catalog/clusters:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Embedding clusters from the jobs' latest `clusters` policy (empty when none)
+      operationId: catalogClusters
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Cluster' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /catalog/enrich:
+    post:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Mark items for re-enrichment (all with text when no ids are given)
+      operationId: enrichItems
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { external_ids: { type: array, items: { type: string }, maxItems: 500 } } }
+      responses:
+        '202':
+          description: queued
+          content:
+            application/json:
+              schema: { type: object, properties: { queued: { type: integer }, without_text: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /connectors/{source}/test:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Dry-run a connector's mapping and the ingest allowlist
+      operationId: testConnector
+      description: |
+        Nothing is written. GA4 and Shopify are tested from their side; the answer says how.
+      parameters:
+        - { name: source, in: path, required: true, schema: { type: string, enum: [backend, sdk, posthog, ga4, shopify, csv] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { payload: { type: object, description: 'a canonical event (backend, sdk, csv) or a PostHog event; a synthetic one when absent' } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectorTest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /settings:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Tenant settings
+      operationId: getSettings
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Change tenant settings (owners, staff, admin keys)
+      operationId: updateSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettingsPatch' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /settings/pause:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Turn every surface off, remembering each status
+      operationId: pauseAll
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /settings/resume:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Restore every paused surface to its remembered status
+      operationId: resumeAll
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /retention:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Retention per data class
+      operationId: getRetention
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RetentionPolicy' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Set retention for the listed data classes (owners)
+      operationId: putRetention
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, items: { $ref: '#/components/schemas/RetentionPolicy' } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RetentionPolicy' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /notifications:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Notification centre
+      operationId: listNotifications
+      parameters:
+        - { name: unread, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /notifications/read-all:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Mark every notification read
+      operationId: readAllNotifications
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, marked: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /notifications/{id}/read:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Mark one notification read
+      operationId: readNotification
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /approvals:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Two-person-rule requests
+      operationId: listApprovals
+      parameters:
+        - { name: state, in: query, schema: { type: string, enum: [pending, approved, rejected] } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Approval' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Request an approval
+      operationId: createApproval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /approvals/{id}/approve:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Approve and apply (a different panel user when the two-person rule is on)
+      operationId: approveApproval
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /approvals/{id}/reject:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Reject (or withdraw) a request
+      operationId: rejectApproval
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /scheduled-reports:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Scheduled reports (the jobs render and send them)
+      operationId: listReports
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ScheduledReport' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Schedule a report
+      operationId: createReport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduledReportInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduledReport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /scheduled-reports/{id}:
+    patch:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Change a scheduled report
+      operationId: updateReport
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduledReportInput' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduledReport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Delete a scheduled report
+      operationId: deleteReport
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /webhook-outbox:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Webhook delivery log
+      operationId: listOutbox
+      parameters:
+        - { name: state, in: query, schema: { type: string, enum: [pending, delivered, failing] } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/OutboxEntry' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Queue a test delivery to every endpoint
+      operationId: enqueueWebhookTest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { event: { type: string, enum: [test] } } }
+      responses:
+        '202':
+          description: queued
+          content:
+            application/json:
+              schema: { type: object, properties: { queued: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /webhook-outbox/{id}/retry:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Make an undelivered row due now
+      operationId: retryOutbox
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /webhook-outbox/{id}:
+    delete:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Delete an outbox row
+      operationId: deleteOutbox
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /saved-views:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: The caller's saved views (panel sessions only)
+      operationId: listViews
+      parameters:
+        - { name: screen, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SavedView' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Save a view
+      operationId: createView
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SavedViewInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /saved-views/{id}:
+    patch:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Rename or update a view
+      operationId: updateView
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SavedViewInput' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Delete a view
+      operationId: deleteView
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/tenants:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Tenants with usage
+      operationId: staffTenants
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/StaffTenant' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Create a tenant, its first admin key (secret shown once) and its owner's invite
+      operationId: createTenant
+      parameters:
+        - { name: reveal, in: query, schema: { type: string, enum: ['1'] }, description: also return the owner's invite token }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { $ref: '#/components/schemas/StaffTenant' }
+                  key: { type: object, properties: { id: { type: string }, scope: { type: string }, prefix: { type: string }, secret: { type: string } } }
+                  invite: { $ref: '#/components/schemas/Invite' }
+                  invite_token: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /admin/tenants/{slug}:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: One tenant with its people, invites and keys
+      operationId: staffTenantDetail
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { $ref: '#/components/schemas/StaffTenant' }
+                  members: { type: array, items: { $ref: '#/components/schemas/Member' } }
+                  invites: { type: array, items: { $ref: '#/components/schemas/Invite' } }
+                  keys: { type: array, items: { $ref: '#/components/schemas/ApiKey' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Suspend or resume a tenant, change its plan, limits, brand or account policy
+      operationId: updateTenant
+      description: |
+        A suspended tenant's `/recommendations` answer with the fallback list (`fallback: true`, arm
+        `none`, outside the ledger); ingest keeps working.
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                suspended: { type: boolean }
+                daily_llm_budget_cents: { type: integer }
+                name: { type: string }
+                accent: { type: string }
+                accent_secondary: { type: string }
+                locale_default: { type: string, enum: [nl, en] }
+                plan: { type: string, enum: [trial, standard, enterprise] }
+                request_quota_monthly: { type: integer, minimum: 0, description: 0 clears the quota }
+                seats: { type: integer, minimum: 0, description: 0 clears the seat limit }
+                mfa_required: { type: boolean }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: object, properties: { slug: { type: string }, suspended_at: { type: [string, 'null'], format: date-time } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/health:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Platform health
+      operationId: staffHealth
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformHealth' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /admin/settings:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Platform settings and LLM prices
+      operationId: staffSettings
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Change platform settings (no credentials)
+      operationId: updateStaffSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlatformSettingsPatch' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /admin/audit:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Audit log across tenants
+      operationId: staffAudit
+      parameters:
+        - { name: tenant, in: query, schema: { type: string } }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: actor, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------- accounts (docs/ACCOUNTS_API.md) ----------
+  /auth/login:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Sign in with email and password
+      operationId: authLogin
+      description: |
+        Sets the session cookie. Failures count per email and per client address: 5 for one email
+        in 15 minutes lock it for 15 minutes (`account_locked`), 30 from one address refuse that
+        address (`too_many_attempts`). An unknown email, a wrong password and a disabled account
+        all answer `bad_credentials`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email, password], properties: { email: { type: string }, password: { type: string } } }
+      responses:
+        '200':
+          description: signed in (MFA may still be due)
+          content:
+            application/json:
+              schema: { type: object, required: [mfa_required, mfa_setup_required], properties: { mfa_required: { type: boolean }, mfa_setup_required: { type: boolean } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/mfa:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Complete sign-in with a TOTP code
+      operationId: authMfa
+      description: Five wrong codes in 15 minutes drop the session (`too_many_attempts`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodeInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/orven-sso:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Optional staff sign-in from Orven (magic login)
+      operationId: authOrvenSso
+      description: |
+        Only when `PATTERNA_ORVEN_SSO_SECRET` is set. The token's `iat` must lie within the last 5
+        minutes (30 s skew), `exp` in the future and at most 5 minutes after `iat`; the nonce is
+        single use.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token], properties: { token: { type: string } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: End this session
+      operationId: authLogout
+      responses:
+        '204': { description: signed out }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/me:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: The signed-in person, the current tenant and their memberships
+      operationId: authMe
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Update your profile
+      operationId: authUpdateMe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string, maxLength: 120 } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/tenants:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Tenants this person can switch to
+      operationId: authTenants
+      responses:
+        '200':
+          description: memberships (staff see every tenant)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/MembershipRef' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/tenant:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Switch the session's tenant
+      operationId: authSwitchTenant
+      description: Staff entering a tenant they are not a member of is support access, audited as `support.access` in that tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [slug], properties: { slug: { type: string }, reason: { type: string, maxLength: 500 } } }
+      responses:
+        '200':
+          description: switched
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, role: { type: string }, support: { type: boolean } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /auth/mfa/enrol:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Start (or redo) TOTP enrolment
+      operationId: authMfaEnrol
+      description: When TOTP is already on, a valid current `code` is required; the live secret keeps working until the new one is confirmed.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { code: { type: string } } }
+      responses:
+        '200':
+          description: a pending secret
+          content:
+            application/json:
+              schema: { type: object, required: [otpauth_url, secret], properties: { otpauth_url: { type: string }, secret: { type: string } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/mfa/defer:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Skip two-step enrolment for now (seven days)
+      description: >-
+        "Skip for now" on the enrolment screen. Enrolment stays required (staff, or a workspace that
+        enforces it); the person may work without a second factor for seven days, then the screen
+        returns. Audited as `mfa.deferred`. Refused with `409 mfa_enabled` once TOTP is on.
+      operationId: authMfaDefer
+      responses:
+        '200':
+          description: Deferred
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, until]
+                properties:
+                  ok: { type: boolean }
+                  until: { type: string, format: date-time }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /auth/mfa/confirm:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Confirm the pending TOTP secret with a code
+      operationId: authMfaConfirm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodeInput' }
+      responses:
+        '200':
+          description: TOTP on
+          content:
+            application/json:
+              schema: { type: object, properties: { mfa_enabled: { type: boolean } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/mfa/disable:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Turn TOTP off with a valid code
+      operationId: authMfaDisable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodeInput' }
+      responses:
+        '200':
+          description: TOTP off
+          content:
+            application/json:
+              schema: { type: object, properties: { mfa_enabled: { type: boolean } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /auth/password:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Change your password (current password required)
+      operationId: authChangePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [current_password, new_password], properties: { current_password: { type: string }, new_password: { type: string, minLength: 12, maxLength: 256 } } }
+      responses:
+        '200':
+          description: changed; every other session ended
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, sessions_revoked: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/password/forgot:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Email a password reset link (always 202)
+      operationId: authForgotPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email], properties: { email: { type: string }, locale: { type: string, enum: [nl, en] } } }
+      responses:
+        '202': { $ref: '#/components/responses/Ok' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/password/reset:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Set a new password with a reset token (1 hour, single use)
+      operationId: authResetPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token, password], properties: { token: { type: string }, password: { type: string, minLength: 12, maxLength: 256 } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/invites/lookup:
+    post:
+      tags: [accounts]
+      security: []
+      summary: What an invite link is for (accept page)
+      operationId: authInviteLookup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token], properties: { token: { type: string } } }
+      responses:
+        '200':
+          description: the invite
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitePreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/invites/accept:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Accept an invite (new password, or the existing account's password)
+      operationId: authInviteAccept
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token, password], properties: { token: { type: string }, password: { type: string }, name: { type: string, maxLength: 120 } } }
+      responses:
+        '200':
+          description: accepted and signed in
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, mfa_required: { type: boolean, description: the existing account has TOTP; finish with POST /auth/mfa }, mfa_setup_required: { type: boolean } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/set-password:
+    post:
+      tags: [accounts]
+      security: []
+      deprecated: true
+      summary: Old invite completion; answers 410, use /auth/invites/accept
+      operationId: authSetPassword
+      responses:
+        '410': { description: gone, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/sessions:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Your sessions
+      operationId: authSessions
+      responses:
+        '200':
+          description: sessions
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Session' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/sessions/{id}:
+    delete:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: End one of your sessions
+      operationId: authRevokeSession
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: ended }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /auth/sessions/revoke-all:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Sign out everywhere
+      operationId: authRevokeAllSessions
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { keep_current: { type: boolean } } }
+      responses:
+        '200': { $ref: '#/components/responses/Revoked' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /panel-users:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: People in the current tenant
+      operationId: listMembers
+      responses:
+        '200':
+          description: members
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Member' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Invite a person (alias of POST /invites)
+      operationId: createMemberInvite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteInput' }
+      responses:
+        '201': { $ref: '#/components/responses/InviteCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /panel-users/{id}:
+    patch:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Change a member's role (owners; audited; last-owner guard)
+      operationId: updateMember
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [role], properties: { role: { $ref: '#/components/schemas/TenantRole' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Remove a member from the tenant (owners; last-owner guard)
+      operationId: removeMember
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: removed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /panel-users/{id}/sessions:
+    delete:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Sign a member out of this tenant everywhere (owners)
+      operationId: revokeMemberSessions
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Revoked' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /invites:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Invites of the current tenant (owners)
+      operationId: listInvites
+      responses:
+        '200':
+          description: invites
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Invite' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Invite a person by email (owners; 7 days, single use)
+      operationId: createInvite
+      parameters:
+        - { name: reveal, in: query, schema: { type: string, enum: ['1'] }, description: staff only - also return the token }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteInput' }
+      responses:
+        '201': { $ref: '#/components/responses/InviteCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /invites/{id}/resend:
+    post:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: New token, 7 more days, emailed again
+      operationId: resendInvite
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: string, enum: ['1'] } }
+      responses:
+        '200': { $ref: '#/components/responses/InviteCreated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /invites/{id}:
+    delete:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Revoke an invite
+      operationId: revokeInvite
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /settings/security:
+    get:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Tenant account policy
+      operationId: getSecuritySettings
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SecuritySettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [accounts]
+      security: [{ panelSession: [] }]
+      summary: Enforce MFA, set the idle timeout (owners)
+      operationId: updateSecuritySettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { mfa_required: { type: boolean }, idle_timeout_minutes: { type: integer, minimum: 5, maximum: 1440 } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/SecuritySettings' }
+                  - { type: object, properties: { notified: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /admin/tenants/{slug}/keys:
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Mint a key for a tenant (secret shown once)
+      operationId: staffCreateTenantKey
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeyInput' }
+      responses:
+        '201': { $ref: '#/components/responses/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/tenants/{slug}/keys/{id}:
+    delete:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Revoke a tenant's key
+      operationId: staffRevokeTenantKey
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/tenants/{slug}/invites:
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Invite a person into a tenant
+      operationId: staffInviteToTenant
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: string, enum: ['1'] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteInput' }
+      responses:
+        '201': { $ref: '#/components/responses/InviteCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /admin/tenants/{slug}/support:
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Enter a tenant for support (audited with the reason)
+      operationId: staffSupportAccess
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 3, maxLength: 500 } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/accounts:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Every account (staff and tenant people)
+      operationId: staffAccounts
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: filter on email or name }
+      responses:
+        '200':
+          description: accounts
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Account' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /admin/accounts/{id}:
+    patch:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Rename, disable or enable an account, grant or remove staff
+      operationId: staffUpdateAccount
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string }, disabled: { type: boolean }, staff: { type: boolean } } }
+      responses:
+        '200':
+          description: the account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/accounts/{id}/mfa-reset:
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Turn an account's TOTP off and end its sessions
+      operationId: staffResetMfa
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/accounts/{id}/sessions:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: An account's sessions
+      operationId: staffAccountSessions
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: sessions
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Session' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: End every session of an account
+      operationId: staffRevokeAccountSessions
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Revoked' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/accounts/{id}/sessions/{sid}:
+    delete:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: End one session of an account
+      operationId: staffRevokeAccountSession
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: sid, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: ended }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/accounts/{id}/memberships/{slug}:
+    put:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Add or change an account's membership in a tenant
+      operationId: staffSetMembership
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [role], properties: { role: { $ref: '#/components/schemas/TenantRole' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Remove an account from a tenant
+      operationId: staffRemoveMembership
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: removed }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /admin/staff-invites:
+    get:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Invites to join staff
+      operationId: staffInvites
+      responses:
+        '200':
+          description: invites
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Invite' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Invite a person to join staff
+      operationId: staffCreateInvite
+      parameters:
+        - { name: reveal, in: query, schema: { type: string, enum: ['1'] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email], properties: { email: { type: string }, locale: { type: string, enum: [nl, en] } } }
+      responses:
+        '201': { $ref: '#/components/responses/InviteCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /admin/staff-invites/{id}:
+    delete:
+      tags: [operator]
+      security: [{ panelSession: [] }]
+      summary: Revoke a staff invite
+      operationId: staffRevokeInvite
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /health:
+    get:
+      tags: [admin]
+      security: []
+      summary: Liveness and dependency status
+      operationId: health
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  postgres: { type: string }
+                  redis: { type: string }
+                  version: { type: string }
+
+  # ---- panel backends (docs/PANEL_API.md, "Panel backends") -----------------------------------
+  /connectors/sources:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Connectable sources in display order, each with status, setup values and recent runs
+      operationId: listConnectorSources
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ConnectorSource' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /settings/alerts/test:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Send a test alert (owners, staff, admin keys)
+      description: |
+        Writes one notification of kind `alert_test` and, when an alert address is set and the
+        database has an `email_outbox` table, one email row for the jobs to deliver. Slack delivery is
+        the jobs' as well; the answer says whether a webhook is configured.
+      operationId: testAlerts
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertTestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /catalog/enrich/runs:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Enrichment run history (written by the jobs' enrich job), newest first
+      operationId: listEnrichRuns
+      parameters:
+        - { name: external_id, in: query, schema: { type: string }, description: "only runs that touched this item, each with the item's outcome" }
+        - { name: kind, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 20 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrichmentHistory' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /catalog/gold:
+    get:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: The gold set with precision and recall of the current tags against it
+      operationId: getGoldSet
+      parameters:
+        - { name: sample, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: also return a stable sample of unlabelled published items }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GoldSet' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Replace the gold set (editors and up); scores it and stores the score in the history
+      operationId: putGoldSet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoldSetInput' }
+      responses:
+        '200':
+          description: the new gold set and its score
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GoldSet' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /catalog/items/bulk:
+    post:
+      tags: [catalog]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Change status, collection and tags of up to 500 items at once (editors and up, audited)
+      description: |
+        Health-claim tags (the taxonomy's `health_claim`, or a `claim:` prefix) are never approved in
+        bulk: adding or approving one opens a `claim_tag` approval request instead.
+      operationId: bulkItems
+      parameters:
+        - { name: note, in: query, schema: { type: string }, description: audit note (also accepted in the body) }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BulkItemsInput' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkItemsResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /audiences/cohorts:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Declared-goal and persona cohorts with sizes and tap rates
+      description: |
+        Profiled users only (non_profiled traffic belongs to no cohort). A user with several goals
+        counts in each. Tap rate is taps over seen slots of the members' slates in the window.
+      operationId: audienceCohorts
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 180, default: 28 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cohorts' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /audiences/consent:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Consent changes into each mode per ISO week (Monday, UTC), zero-filled, current week last
+      operationId: consentTimeline
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+        - { name: weeks, in: query, schema: { type: integer, minimum: 1, maximum: 104, default: 12 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsentTimeline' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /surfaces/{key}/heatmap:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Seen and tap rate per served position per UTC day (shadow slates excluded)
+      operationId: surfaceHeatmap
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 90, default: 28 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Heatmap' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /annotations:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Chart annotations (user notes plus changes read from the audit log)
+      operationId: listAnnotations
+      parameters:
+        - { name: surface, in: query, schema: { type: string }, description: that surface's markers plus the workspace-wide ones }
+        - { name: from, in: query, schema: { type: string }, description: date or RFC 3339 time (default 90 days ago) }
+        - { name: to, in: query, schema: { type: string }, description: date or RFC 3339 time (default now) }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Annotation' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [admin]
+      security: [{ panelSession: [] }]
+      summary: Write a note on the charts (editors and up; a panel user is the author)
+      operationId: createAnnotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnotationInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Annotation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /annotations/{id}:
+    delete:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Delete a note (its author or an owner)
+      operationId: deleteAnnotation
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /presence:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Panel users seen in the last 60 seconds, newest first (in memory)
+      operationId: getPresence
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/PresenceEntry' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [admin]
+      security: [{ panelSession: [] }]
+      summary: Heartbeat (every 20 to 30 s); answers with the current list
+      operationId: postPresence
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path: { type: string, maxLength: 200, description: the panel path the user is on }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/PresenceEntry' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /scheduled-reports/{id}/send:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Queue a send now (editors and up); a send already queued is returned instead
+      operationId: sendReport
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '202':
+          description: queued; the jobs render and deliver it
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportSend' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /scheduled-reports/{id}/history:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Sends of one report, newest first
+      operationId: reportHistory
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReportSend' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /settings/export:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Export the workspace (owners, staff, admin keys)
+      description: |
+        A zip of items, surfaces, flows, experiments, the published ledger and the live ledger of the
+        last year as CSV files, written to EXPORT_DIR. Real rows only; the event log is not in it (that
+        is the proof export, per period).
+      operationId: exportWorkspace
+      responses:
+        '201':
+          description: written
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceExport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /settings/exports/{id}:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Download a workspace export (owners, staff, admin keys)
+      operationId: downloadWorkspaceExport
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: the zip
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+  /proof/exports/{id}/download:
+    get:
+      tags: [proof]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Download a proof export's CSV files as one zip (editors and up)
+      operationId: downloadProofExport
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: the zip
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+  /settings/delete-workspace:
+    post:
+      tags: [admin]
+      security: [{ panelSession: [] }]
+      summary: Schedule the workspace's deletion seven days out (owners)
+      description: |
+        `confirm` must be the workspace slug. With the two-person rule on, the request becomes a
+        `workspace_deletion` approval another owner must approve; approving schedules it. Cancellable
+        until the date; the jobs delete every row of the workspace then.
+      operationId: deleteWorkspace
+      parameters:
+        - { name: note, in: query, schema: { type: string }, description: audit note (also accepted in the body) }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm: { type: string, description: the workspace slug }
+                note: { type: string }
+      responses:
+        '202':
+          description: scheduled, or waiting for approval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceDeletion' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /settings/delete-workspace/cancel:
+    post:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Cancel a scheduled deletion and withdraw a pending deletion request (owners, staff, admin keys)
+      operationId: cancelWorkspaceDeletion
+      responses:
+        '200':
+          description: cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  cancelled_schedule: { type: boolean }
+                  withdrawn_approvals: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: Scoped tenant key, hashed at rest.
+    panelSession:
+      type: apiKey
+      in: cookie
+      name: patterna_session
+      description: Panel session (password + TOTP or Orven magic login). Staff sessions carry the operator role.
+
+  parameters:
+    IncludeSynthetic:
+      name: include_synthetic
+      in: query
+      description: true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both.
+      schema: { type: boolean, default: false }
+
+  responses:
+    Ok:
+      description: done
+      content:
+        application/json:
+          schema: { type: object, properties: { ok: { type: boolean } } }
+    Revoked:
+      description: sessions ended
+      content:
+        application/json:
+          schema: { type: object, properties: { revoked: { type: integer } } }
+    InviteCreated:
+      description: the invite (emailed); the token only for staff asking with reveal=1
+      content:
+        application/json:
+          schema: { type: object, required: [invite], properties: { invite: { $ref: '#/components/schemas/Invite' }, token: { type: string } } }
+    KeyCreated:
+      description: the key with its secret, shown once
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: '#/components/schemas/ApiKey' }
+              - type: object
+                properties:
+                  secret: { type: string }
+    BadRequest:
+      description: malformed request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: "missing, revoked, expired or wrongly scoped key, or no session (unauthorized, wrong_scope, bad_credentials, bad_mfa, mfa_pending)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: "per-key or per-user limit hit (rate_limited, account_locked with details.retry_after_seconds, too_many_attempts)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: "the request is well formed but cannot be applied (mode_conflict, no_candidates, unknown_item with details.unknown_item_ids, displayed_position_required, pii_rejected, bad_tester_id, bad_webhook_url, bad_slack_webhook, unknown_parent, parent_cycle)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: "the role may not do this (forbidden_role, forbidden_scope, staff_only, session_required, same_person, mfa_enrolment_required)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: "no such resource in this tenant (not_found, unknown_surface, unknown_request, unknown_flow_version, item_not_found)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: "state conflict (surface_off, experiment_running, signing_secret_exists, approval_required, approval_pending, approval_decided, exists, no_endpoints, deletion_scheduled, export_not_ready, last_owner, already_member, seat_limit, mfa_enforced)"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    SigningSecret:
+      description: the secret, shown once
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [signing_secret]
+            properties:
+              signing_secret: { type: string, description: "pss_ followed by 64 hex characters; the HMAC key is this string's UTF-8 bytes" }
+              issued_at: { type: string, format: date-time }
+              note: { type: string }
+
+    Gone:
+      description: the file behind the resource was removed (exports are kept for the retention period)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: { type: string, description: "stable machine code; the full list is in the API description" }
+        message: { type: string }
+        request_id: { type: string }
+        details: { type: object }
+
+    Mode:
+      type: string
+      enum: [personalized, cohort, non_profiled]
+
+    RecommendRequest:
+      type: object
+      required: [surface, mode, context]
+      properties:
+        surface: { type: string, example: home_articles }
+        mode: { $ref: '#/components/schemas/Mode' }
+        user_id: { type: string, description: absent in non_profiled mode }
+        session_id: { type: string, description: rotating id; required in non_profiled mode }
+        context:
+          type: object
+          required: [locale]
+          properties:
+            locale: { type: string, example: nl, description: "a language tag; matched on its base language (nl-NL → nl) against every locale an item carries. A locale no published item carries widens to all items." }
+            app_version: { type: string }
+            platform: { type: string, enum: [ios, android, web] }
+            hour_bucket: { type: integer, minimum: 0, maximum: 23 }
+            anchor_item_id: { type: string, description: "the item the user is on (an article, a community). Resolved against the whole catalog, any kind: an article can anchor a product list (reason pairs_with)." }
+            premium: { type: boolean }
+            candidate_kinds: { type: array, items: { type: string } }
+            measured: { type: boolean, default: true, description: "false when the user did not allow usage analytics. The slate is served and logged with exact propensities, but it stays out of the ledger, the power calculation and all learning in both arms; the app reports no interactions for it. Consent is decided before the list is drawn, so leaving these slates out of both arms keeps the comparison unbiased." }
+        slots: { type: integer, minimum: 1, maximum: 50 }
+        exclude_item_ids: { type: array, items: { type: string }, maxItems: 200 }
+        shadow: { type: boolean, description: log and return but mark as not shown }
+        assignment_unit: { type: string, pattern: '^[0-9a-fA-F]{64}$', description: "non_profiled only (ignored in the other modes): a keyed hash the customer computes from its own stable user id, e.g. hex HMAC-SHA256(user id, a key the customer holds). Used only to assign the holdout arm and as the ledger's clustering unit (stored only as a salted hash in unit_hash). Never stored raw, never ranked on, never joined to events. Without it the unit is the rotating session id." }
+        deadline_ms: { type: integer, minimum: 10, maximum: 10000, description: "the client's own deadline; same as the X-Deadline-Ms header (the shorter wins)" }
+
+    Slate:
+      type: object
+      required: [request_id, surface, arm, policy_version, items]
+      properties:
+        request_id: { type: string }
+        surface: { type: string }
+        arm: { type: string, enum: [control, treatment, none] }
+        policy_version: { type: string }
+        flow_version: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SlateItem' }
+        fallback: { type: boolean, description: "true when the non-personalized list was returned as the safety net (timeout, storage trouble, no active flow)" }
+        shown: { type: boolean, description: "false when the slate has fewer items than the surface's min_slots: hide the block. Such a slate is logged as not shown and stays out of the ledger and the metrics." }
+        latency_ms: { type: integer }
+
+    SlateItem:
+      type: object
+      required: [item_id, kind, position, reason_key, reason]
+      properties:
+        item_id: { type: string, description: the customer's external id }
+        kind: { type: string }
+        position: { type: integer, minimum: 0, description: "0-based: items[0] has position 0" }
+        reason_key:
+          type: string
+          example: similar_to_read
+          description: |
+            Which signal won the slot; one of similar_to_read, similar, pairs_with, matches_goals,
+            more_about_tag, people_like_you, trending, editors_pick, new, popular (a string, so a
+            new key is not a breaking change). similar_to_read: item_to_item with an anchor of the same
+            kind; pairs_with: an anchor of another kind (article → product); similar: item_to_item
+            without an anchor; matches_goals: content_affinity won on a goal the user declared;
+            more_about_tag: content_affinity won on behaviour; people_like_you: persona_bayes or
+            user_bayes; trending; editors_pick: curated; new: freshness or the newest list;
+            popular: the popular list.
+        reason:
+          type: object
+          description: rendered reason text per locale; never contains a placeholder
+          additionalProperties: { type: string }
+          example: { nl: "Omdat je Magnesium en slaap las", en: "Because you read Magnesium en slaap" }
+        generator: { type: string }
+        score: { type: number }
+        phase_fit: { type: array, items: { type: string }, description: phase tags for on-device re-sorting; never used server-side }
+
+    Interaction:
+      type: object
+      required: [item_id, position, type, occurred_at]
+      properties:
+        item_id: { type: string }
+        kind: { type: string, description: "ignored: the kind comes from the logged slate" }
+        position: { type: integer, minimum: 0, description: "the slot Patterna served (0-based); the engine records the served slot from its log" }
+        displayed_position: { type: integer, minimum: 0, description: "where the app showed it (0-based), when it re-sorted on the device; required on a device_resort surface" }
+        block: { type: string, maxLength: 32, description: "which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace" }
+        type: { type: string, enum: [seen, click, dismiss] }
+        occurred_at: { type: string, format: date-time }
+
+    Event:
+      type: object
+      required: [event_id, type, occurred_at, source]
+      properties:
+        event_id: { type: string }
+        type: { type: string }
+        occurred_at: { type: string, format: date-time }
+        user_id: { type: string }
+        session_id: { type: string }
+        surface: { type: string }
+        request_id: { type: string }
+        source: { type: string, enum: [backend, sdk, posthog, ga4, shopify, csv, synthetic] }
+        signature: { type: string, description: "lowercase hex HMAC-SHA256 over the canonical JSON of the event without this field (sorted keys, no whitespace); see contracts/events.md" }
+        synthetic: { type: boolean, default: false }
+        context:
+          type: object
+          properties:
+            locale: { type: string }
+            app_version: { type: string }
+            platform: { type: string }
+            hour_bucket: { type: integer }
+          additionalProperties: false
+        props: { type: object }
+
+    ItemUpsert:
+      type: object
+      required: [external_id, kind, title, locale]
+      properties:
+        external_id: { type: string }
+        kind: { type: string, enum: [document, product, community, event, tip] }
+        collection: { type: string }
+        title: { type: string, description: editorial title only }
+        locale: { type: string, description: "the primary locale; stored as its base language (nl-NL → nl)" }
+        locales: { type: array, maxItems: 20, items: { type: string }, description: "every locale the item reads in (e.g. a Dutch document with an English translation: [nl, en]); the primary locale is always included" }
+        status: { type: string, enum: [draft, scheduled, published, archived], default: published }
+        premium: { type: boolean, default: false }
+        published_at: { type: string, format: date-time }
+        attributes: { type: object, description: "price_cents, currency, difficulty, duration_min, categories[], phase_fit[], image_url, url" }
+        text: { type: string, description: "body text for enrichment; stored only as embedding and tags, never returned" }
+        tags:
+          type: array
+          items:
+            type: object
+            properties:
+              tag: { type: string }
+              weight: { type: number }
+
+    Item:
+      type: object
+      properties:
+        external_id: { type: string }
+        kind: { type: string }
+        collection: { type: string }
+        title: { type: string }
+        locale: { type: string }
+        locales: { type: array, items: { type: string } }
+        status: { type: string }
+        premium: { type: boolean }
+        published_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        attributes: { type: object }
+        tags:
+          type: array
+          items:
+            type: object
+            properties:
+              tag: { type: string }
+              weight: { type: number }
+              source: { type: string }
+              approved: { type: boolean }
+        enrichment:
+          type: object
+          properties:
+            status: { type: string, enum: [pending, done, failed, skipped] }
+            model: { type: string }
+            updated_at: { type: string, format: date-time }
+
+    UserProfile:
+      type: object
+      properties:
+        mode: { $ref: '#/components/schemas/Mode' }
+        premium: { type: boolean }
+        goals: { type: array, items: { type: string }, description: tenant taxonomy tags }
+        activity_level: { type: string, enum: [low, moderate, high] }
+        stress_level: { type: string, enum: [low, moderate, high] }
+        wearable: { type: string }
+        supplements_use: { type: string, enum: [none, some, stack] }
+        locale: { type: string }
+
+    DeletionRequest:
+      type: object
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        requested_at: { type: string, format: date-time }
+        rows_deleted_at: { type: [string, 'null'], format: date-time }
+        models_retrained_at: { type: [string, 'null'], format: date-time }
+
+    Trace:
+      type: object
+      properties:
+        request_id: { type: string }
+        served_at: { type: string, format: date-time }
+        surface: { type: string }
+        mode: { type: string }
+        arm: { type: string }
+        policy_version: { type: string }
+        explored: { type: boolean }
+        slate:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id: { type: string }
+              position: { type: integer }
+              propensity: { type: number }
+              reason_key: { type: string }
+              generator: { type: string }
+              contributions: { type: object, additionalProperties: { type: number } }
+              outcome: { type: string, enum: [seen, click, dismiss, none] }
+              block: { type: string, description: the block the interaction reported }
+              displayed_position: { type: integer, description: "where the app showed it, when reported" }
+
+    SurfaceInput:
+      type: object
+      properties:
+        key: { type: string }
+        name: { type: string }
+        item_kinds: { type: array, items: { type: string } }
+        slots: { type: integer }
+        fallback: { type: object, description: "{ kind: newest | curated, item_ids: [] }" }
+        exploration_share: { type: number, minimum: 0, maximum: 1 }
+        status: { type: string, enum: [shadow, testers, live, off] }
+        testers: { type: array, items: { type: string }, maxItems: 200, description: "user ids from the app (never emails)" }
+        notes: { type: string, maxLength: 4000, description: placement notes }
+        device_resort: { type: boolean, description: "the app re-sorts the slate on the device. Allowed under a holdout (both arms are re-sorted by the same rule, the ledger stays intention to treat on served slates); every interaction must then carry displayed_position. PATCH only." }
+        min_slots: { type: integer, minimum: 0, maximum: 50, description: "a slate shorter than this after the filters is returned with shown=false and logged as not shown (outside the ledger and metrics). 0 = always shown. PATCH only." }
+
+    Surface:
+      allOf:
+        - { $ref: '#/components/schemas/SurfaceInput' }
+        - type: object
+          properties:
+            active_flow_version: { type: [integer, 'null'] }
+            impressions_7d: { type: integer }
+            tap_rate_7d: { type: [number, 'null'] }
+            experiment_id: { type: [string, 'null'] }
+            tester_requests_7d: { type: integer, description: "requests marked X-Patterna-Tester: 1 in 7 days" }
+
+    FlowConfig:
+      type: object
+      description: The versioned recipe of a surface. Generators run in parallel, then filters, ranker, exploration.
+      required: [generators, ranker, exploration]
+      properties:
+        generators:
+          type: array
+          items:
+            type: object
+            required: [kind, weight]
+            properties:
+              kind: { type: string, enum: [trending, curated, item_to_item, content_affinity, persona_bayes, user_bayes, surface_specific] }
+              weight: { type: number }
+              params: { type: object }
+        filters:
+          type: object
+          properties:
+            exclude_seen_days: { type: integer, default: 7 }
+            locales: { type: array, items: { type: string } }
+            premium_policy: { type: string, enum: [allow, cap, exclude], default: cap }
+            premium_cap: { type: integer, default: 2 }
+            per_collection_cap: { type: integer, default: 3 }
+            freshness_days: { type: [integer, 'null'] }
+            diversity: { type: number, minimum: 0, maximum: 1, default: 0, description: "MMR-style penalty applied inside the sampler (score minus diversity x highest tag cosine to the items already picked); logged propensities stay exact" }
+        ranker:
+          type: object
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [linear, learned_linear, gbdt], description: "gbdt applies the nightly ranker_gbdt policy (gradient-boosted trees over the generators' contributions and item features, exported to JSON and evaluated in the engine); learned_linear applies the nightly ranker_linear policy's per-generator weights (fitted from logged taps) in place of the configured weights" }
+            policy_version: { type: string, description: a `policies.version`; empty means the built-in linear weights }
+        exploration:
+          type: object
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [none, plackett_luce] }
+            temperature: { type: number, default: 0.7 }
+            share: { type: number, default: 0.2 }
+        reasons:
+          type: object
+          description: |
+            Reason templates per key, per locale. A key is a reason key (`matches_goals`,
+            `pairs_with`, … see SlateItem.reason_key) or a generator kind (`item_to_item`,
+            `trending`, …); for a slot, the reason-key template wins over its generator's, which
+            wins over the default text. Placeholders: `{anchor_title}` (the anchor's title),
+            `{tag}` (the tag that carried the win, by its taxonomy label in that locale; phases and
+            health claims are never named), `{segment}` (the user's persona, by its taxonomy label,
+            kind `segment`). A placeholder the request cannot fill is never shipped: that locale
+            gets the default text. Unknown keys, locales or placeholders are refused on save (400
+            `invalid_reason_template`). A top-level `diversity` key from older clients is ignored
+            and dropped; diversity is `filters.diversity`.
+          additionalProperties: { type: object, additionalProperties: { type: string, maxLength: 200 } }
+          example: { item_to_item: { nl: "Omdat je {anchor_title} las", en: "Because you read {anchor_title}" }, more_about_tag: { nl: "Meer over {tag}" } }
+
+    Flow:
+      type: object
+      properties:
+        version: { type: integer }
+        config: { $ref: '#/components/schemas/FlowConfig' }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+        activated_at: { type: [string, 'null'], format: date-time }
+        created_by: { type: [string, 'null'] }
+
+    SimulationResult:
+      type: object
+      properties:
+        days: { type: integer }
+        impressions_used: { type: integer }
+        effective_sample_size: { type: number }
+        metric: { type: string }
+        current_policy: { type: number }
+        candidate_policy: { type: number }
+        ci_low: { type: number }
+        ci_high: { type: number }
+        note: { type: string }
+        twin_curve:
+          type: array
+          description: from the jobs' latest twin policy for the surface, when one exists
+          items:
+            type: object
+            properties:
+              week: { type: integer }
+              control: { type: number }
+              treatment: { type: number }
+        lift_by_truth_scale: { type: object, additionalProperties: true }
+
+    ExperimentInput:
+      type: object
+      required: [surface, name, primary_metric]
+      properties:
+        surface: { type: string }
+        name: { type: string }
+        treatment_share: { type: number, default: 0.5 }
+        primary_metric:
+          type: string
+          enum: [tap_rate, second_item_rate, join_rate, engaged_after_tap]
+          description: |
+            Per served slate (intention to treat), clustered on the unit:
+            tap_rate: at least one tap. second_item_rate: after the slate's first tap, a tap on
+            another item in the same session (session id, else the unit) within 30 minutes.
+            join_rate (surfaces that serve communities, else 400 metric_not_applicable): a
+            community_joined for a community in the slate within 7 days, by the slate's user,
+            session or request. engaged_after_tap: item_engaged or item_completed for a tapped item
+            within 7 days of the tap, same identity match. Unmeasured and not-shown slates are
+            outside every metric.
+        stratify_by: { type: string, default: persona }
+        baseline_rate: { type: number }
+        relative_change: { type: number, description: "the change to detect, e.g. 0.2" }
+
+    Experiment:
+      allOf:
+        - { $ref: '#/components/schemas/ExperimentInput' }
+        - type: object
+          properties:
+            id: { type: string }
+            started_at: { type: [string, 'null'], format: date-time }
+            ended_at: { type: [string, 'null'], format: date-time }
+            readable_sample: { type: integer }
+            n_control: { type: integer }
+            n_treatment: { type: integer }
+            readable_at: { type: [string, 'null'], format: date, description: projected date the sample is reached }
+
+    LedgerRow:
+      type: object
+      properties:
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        surface: { type: string }
+        metric: { type: string }
+        control_rate: { type: number }
+        treatment_rate: { type: number }
+        difference: { type: number }
+        ci_low: { type: [number, 'null'], description: null while an arm has fewer than two units }
+        ci_high: { type: [number, 'null'] }
+        n_control: { type: integer }
+        n_treatment: { type: integer }
+        n_users_control: { type: integer }
+        n_users_treatment: { type: integer }
+        srm_p: { type: number, description: sample-ratio-mismatch p-value; below 0.001 the row must not be read }
+        note: { type: string }
+        readable: { type: boolean, description: false below the readable sample; interval shown dashed }
+        revenue_cents_control: { type: [integer, 'null'] }
+        revenue_cents_treatment: { type: [integer, 'null'] }
+        export_uri: { type: [string, 'null'] }
+
+    ConnectorRun:
+      type: object
+      properties:
+        source: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        status: { type: string }
+        rows_in: { type: integer }
+        rows_mapped: { type: integer }
+        fields_dropped: { type: object, additionalProperties: { type: integer } }
+        error: { type: [string, 'null'] }
+        health: { type: string, enum: [ok, failing, never] }
+        last_event_at: { type: string, format: date-time, description: 'backend and SDK sources: from events of the last 30 days' }
+        config:
+          type: object
+          properties:
+            webhook_url: { type: [string, 'null'] }
+            key_prefix: { type: [string, 'null'], description: prefix of the newest ingest key (never the secret) }
+            docs_href: { type: string }
+
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        scope: { type: string }
+        prefix: { type: string }
+        environment: { type: string }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time, description: from key_usage (flushed every 10 s) }
+        requests_today: { type: integer }
+        requests_14d: { type: array, items: { type: integer }, minItems: 14, maxItems: 14, description: 'requests per UTC day, oldest first, today last' }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_by: { type: [string, 'null'], description: email of the person who minted it }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        actor: { type: [string, 'null'] }
+        action: { type: string }
+        target: { type: string }
+        diff: { type: [object, 'null'] }
+        at: { type: string, format: date-time }
+        tenant: { type: [string, 'null'], description: tenant slug (operator audit only) }
+
+    Ok:
+      type: object
+      properties:
+        ok: { type: boolean }
+
+    Overview:
+      type: object
+      properties:
+        checklist:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string, enum: [connect_source, import_catalog, enrich_tags, create_surface, go_shadow, add_testers, go_live_holdout, first_readable_ledger] }
+              title: { type: string }
+              state: { type: string, enum: [done, todo, blocked] }
+              href: { type: string }
+        status:
+          type: object
+          properties:
+            engine_version: { type: string }
+            jobs_last_run_at: { type: [string, 'null'], format: date-time }
+            items: { type: integer }
+            impressions_7d: { type: integer }
+            fallback_rate_7d: { type: [number, 'null'] }
+            p99_ms_7d: { type: [number, 'null'] }
+            alerts:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string, enum: [srm, fallback_rate, connector_failure] }
+                  surface: { type: string }
+                  message: { type: string }
+                  since: { type: string, format: date-time }
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              at: { type: string, format: date-time }
+              actor: { type: [string, 'null'] }
+              action: { type: string }
+              target: { type: string }
+        analyst_note:
+          description: the newest weekly analyst note of the data set (include_synthetic), or null
+          oneOf: [{ $ref: '#/components/schemas/AnalystNote' }, { type: 'null' }]
+
+    SurfaceMetrics:
+      type: object
+      properties:
+        days:
+          type: array
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              impressions: { type: integer }
+              taps: { type: integer }
+              tap_rate: { type: [number, 'null'] }
+              fallback_rate: { type: [number, 'null'], description: "safety-net fallbacks plus slates the client abandoned, over slates shown" }
+              client_abandoned_rate: { type: [number, 'null'] }
+              unmeasured_share: { type: [number, 'null'], description: "slates requested with context.measured=false (outside the ledger and learning)" }
+              p99_ms: { type: [number, 'null'] }
+              explored_share: { type: [number, 'null'] }
+
+    PreviewRequest:
+      type: object
+      properties:
+        user_id: { type: string }
+        session_id: { type: string, description: generated when absent in non_profiled mode }
+        mode: { $ref: '#/components/schemas/Mode' }
+        locale: { type: string, default: nl }
+        flow_version: { type: integer, description: preview a draft version }
+        slots: { type: integer }
+
+    Preview:
+      type: object
+      properties:
+        slate: { $ref: '#/components/schemas/Slate' }
+        contributions:
+          type: object
+          description: item id → generator → contribution
+          additionalProperties: { type: object, additionalProperties: { type: number } }
+
+    CuratedItem:
+      type: object
+      required: [item_id]
+      properties:
+        item_id: { type: string }
+        order: { type: integer, description: ascending; defaults to the position in the list }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time, description: exclusive }
+
+    CuratedListInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        items: { type: array, maxItems: 200, items: { $ref: '#/components/schemas/CuratedItem' } }
+
+    CuratedList:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        items: { type: array, items: { $ref: '#/components/schemas/CuratedItem' } }
+        created_by: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ImpressionStream:
+      type: object
+      properties:
+        cursor: { type: string, format: date-time }
+        impressions:
+          type: array
+          items:
+            type: object
+            properties:
+              request_id: { type: string }
+              served_at: { type: string, format: date-time }
+              surface: { type: string }
+              mode: { type: string }
+              arm: { type: string }
+              flow_version: { type: integer }
+              policy_version: { type: string }
+              fallback: { type: boolean }
+              explored: { type: boolean }
+              shadow: { type: boolean }
+              latency_ms: { type: integer }
+              slots:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    item_id: { type: string }
+                    position: { type: integer }
+                    propensity: { type: number }
+                    reason_key: { type: string }
+                    generator: { type: string }
+
+    LedgerWeek:
+      type: object
+      properties:
+        week_start: { type: string, format: date }
+        surface: { type: string }
+        arm: { type: string, enum: [control, treatment] }
+        impressions: { type: integer, description: impressions reported as seen }
+        taps: { type: integer }
+        rate: { type: number }
+        lo: { type: number }
+        hi: { type: number }
+        users: { type: integer, description: randomised units with a seen impression that week }
+
+    Power:
+      type: object
+      properties:
+        baseline: { type: number }
+        relative_change: { type: number }
+        readable_sample: { type: integer, description: per arm }
+        curve:
+          type: array
+          items:
+            type: object
+            properties:
+              relative_change: { type: number }
+              sample: { type: integer }
+
+    TaxonomyTagInput:
+      type: object
+      required: [tag]
+      properties:
+        tag: { type: string }
+        kind: { type: string, enum: [topic, goal, format, audience, phase, claim, segment], default: topic, description: "segment names a persona for the {segment} reason placeholder" }
+        parent: { type: [string, 'null'] }
+        health_claim: { type: boolean }
+        labels: { type: object, additionalProperties: { type: string, maxLength: 60 }, description: "the tag's name in reasons per locale, e.g. {nl: slaap, en: sleep}; a tag without a label for a locale is never named there" }
+
+    TaxonomyTag:
+      allOf:
+        - { $ref: '#/components/schemas/TaxonomyTagInput' }
+        - type: object
+          properties:
+            items: { type: integer }
+            in_taxonomy: { type: boolean, description: false for tags in use that the taxonomy does not list }
+
+    SimilarItem:
+      type: object
+      properties:
+        external_id: { type: string }
+        kind: { type: string }
+        title: { type: string }
+        score: { type: number }
+        shared_tags: { type: array, items: { type: string } }
+        basis: { type: string, enum: [embedding, tags] }
+
+    ItemStats:
+      type: object
+      properties:
+        days: { type: integer }
+        impressions: { type: integer }
+        taps: { type: integer }
+        tap_rate: { type: [number, 'null'] }
+        positions: { type: array, items: { type: object, properties: { position: { type: integer }, count: { type: integer } } } }
+        surfaces: { type: array, items: { type: object, properties: { surface: { type: string }, impressions: { type: integer }, taps: { type: integer } } } }
+
+    Cluster:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        size: { type: integer }
+        top_tags: { type: array, items: { type: string } }
+        examples: { type: array, items: { type: object, properties: { external_id: { type: string }, title: { type: string } } } }
+
+    ConnectorTest:
+      type: object
+      properties:
+        ok: { type: boolean }
+        mapped: { type: integer }
+        dropped_fields: { type: object, additionalProperties: { type: integer } }
+        skipped: { type: integer }
+        message: { type: string }
+        payload: { type: string, enum: [provided, synthetic] }
+
+    WebhookEndpoint:
+      type: object
+      required: [url, events]
+      properties:
+        url: { type: string, description: https }
+        events: { type: array, items: { type: string, enum: [flow.activated, surface.status_changed, ledger.published] } }
+
+    Settings:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        accent: { type: string }
+        default_mode: { $ref: '#/components/schemas/Mode' }
+        daily_llm_budget_cents: { type: integer }
+        settings: { type: object }
+        locale_default: { type: string, enum: [nl, en] }
+        session_rotation_hours: { type: integer }
+        exploration_default: { type: number }
+        premium_policy_default: { type: string, enum: [allow, cap, exclude] }
+        two_person_rule: { type: boolean }
+        suspended_at: { type: [string, 'null'], format: date-time }
+        paused: { type: boolean }
+        deletion_scheduled_for: { type: [string, 'null'], format: date-time, description: set by POST /settings/delete-workspace }
+        deletion_requested_at: { type: [string, 'null'], format: date-time }
+        signing_secret: { type: object, properties: { set: { type: boolean }, issued_at: { type: [string, 'null'], format: date-time } } }
+        connector_credentials:
+          type: object
+          description: write-only credentials; only whether each is set
+          properties:
+            posthog_token: { type: object, properties: { set: { type: boolean } } }
+            shopify_webhook_secret: { type: object, properties: { set: { type: boolean } } }
+        webhooks: { type: array, items: { $ref: '#/components/schemas/WebhookEndpoint' } }
+        alerts:
+          type: object
+          properties:
+            email: { type: string }
+            slack_webhook: { type: object, description: 'write-only: whether it is set and its last characters', properties: { set: { type: boolean }, hint: { type: string } } }
+            srm: { type: boolean }
+            fallback_rate_pct: { type: number }
+            connector_failures: { type: boolean }
+            ledger_published: { type: boolean }
+        llm:
+          type: object
+          properties:
+            provider_overrides: { type: object, additionalProperties: { type: string } }
+            model_pins: { type: object, additionalProperties: { type: string } }
+            budget_cents: { type: integer }
+            spend_today_cents: { type: integer }
+
+    SettingsPatch:
+      type: object
+      properties:
+        name: { type: string }
+        accent: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        default_mode: { $ref: '#/components/schemas/Mode' }
+        daily_llm_budget_cents: { type: integer }
+        locale_default: { type: string, enum: [nl, en] }
+        session_rotation_hours: { type: integer, minimum: 1, maximum: 720 }
+        exploration_default: { type: number, minimum: 0, maximum: 0.5 }
+        premium_policy_default: { type: string, enum: [allow, cap, exclude] }
+        two_person_rule: { type: boolean }
+        webhooks: { type: array, maxItems: 10, items: { $ref: '#/components/schemas/WebhookEndpoint' } }
+        posthog_token: { type: string, description: "24 to 200 random characters the PostHog destination sends in X-Patterna-Token; stored as its SHA-256; empty removes it" }
+        shopify_webhook_secret: { type: string, maxLength: 200, description: "the Shopify app's webhook signing secret; never returned; empty removes it (and the Shopify webhook then refuses every call)" }
+        alerts:
+          type: object
+          properties:
+            email: { type: string }
+            slack_webhook: { type: string, description: "https://hooks.slack.com/... ; empty clears" }
+            srm: { type: boolean }
+            fallback_rate_pct: { type: number }
+            connector_failures: { type: boolean }
+            ledger_published: { type: boolean }
+        llm:
+          type: object
+          properties:
+            provider_overrides: { type: object, additionalProperties: { type: string } }
+            model_pins: { type: object, additionalProperties: { type: string } }
+            budget_cents: { type: integer }
+
+    PauseResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        surfaces: { type: array, items: { type: string }, description: the surfaces whose status changed }
+
+    RetentionPolicy:
+      type: object
+      required: [data_class, days]
+      properties:
+        data_class: { type: string, enum: [events, impressions, interactions, exports, audit, sessions] }
+        days: { type: integer, minimum: 1, maximum: 3650 }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [srm, fallback_rate, connector_failure, ledger_published, flow_activated, deletion_completed, approval_requested, approval_decided, surface_status, alert_test, workspace_deletion, report_sent] }
+        message: { type: string }
+        target: { type: string }
+        read_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    NotificationList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+        unread: { type: integer }
+
+    ApprovalInput:
+      type: object
+      required: [kind, target]
+      properties:
+        kind: { type: string, enum: [flow_activation, claim_tag, workspace_deletion], description: "workspace_deletion requests are created by POST /settings/delete-workspace only; POST /approvals refuses them" }
+        target: { type: string, description: "flow_activation: <surface>@<version>; claim_tag: <kind>/<external_id>/<tag>; workspace_deletion: the slug" }
+        note: { type: string }
+
+    Approval:
+      allOf:
+        - { $ref: '#/components/schemas/ApprovalInput' }
+        - type: object
+          properties:
+            id: { type: string }
+            requested_by: { type: [string, 'null'] }
+            approved_by: { type: [string, 'null'], description: the deciding user (also on rejection) }
+            state: { type: string, enum: [pending, approved, rejected] }
+            decision_note: { type: string }
+            created_at: { type: string, format: date-time }
+            decided_at: { type: [string, 'null'], format: date-time }
+
+    ScheduledReportInput:
+      type: object
+      properties:
+        name: { type: string }
+        screen: { type: string, enum: [proof, surfaces, catalog], default: proof }
+        surface: { type: [string, 'null'] }
+        recipients: { type: array, items: { type: string, format: uuid }, description: panel user ids of this workspace }
+        cadence: { type: string, enum: [weekly, monthly] }
+        locale: { type: string, enum: [nl, en], default: nl }
+
+    ScheduledReport:
+      allOf:
+        - { $ref: '#/components/schemas/ScheduledReportInput' }
+        - type: object
+          properties:
+            id: { type: string }
+            created_by: { type: [string, 'null'] }
+            created_at: { type: string, format: date-time }
+            last_sent_at: { type: [string, 'null'], format: date-time }
+            last_status: { type: [string, 'null'] }
+
+    OutboxEntry:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        event: { type: string, enum: [flow.activated, surface.status_changed, ledger.published, test] }
+        payload: { type: object }
+        attempts: { type: integer }
+        last_error: { type: [string, 'null'] }
+        next_attempt_at: { type: string, format: date-time }
+        delivered_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    SavedViewInput:
+      type: object
+      properties:
+        screen: { type: string, description: required on create; fixed afterwards }
+        name: { type: string }
+        state: { type: object, description: 'filters and columns, at most 64 KiB' }
+
+    SavedView:
+      type: object
+      properties:
+        id: { type: string }
+        screen: { type: string }
+        name: { type: string }
+        state: { type: object }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    # ---------- accounts ----------
+    TenantRole:
+      type: string
+      enum: [owner, editor, viewer]
+
+    CodeInput:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, description: six-digit TOTP code }
+
+    MembershipRef:
+      type: object
+      required: [slug, name, role]
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        accent: { type: string }
+        role: { type: string, enum: [owner, editor, viewer, staff] }
+
+    Me:
+      type: object
+      required: [id, email, name, role, is_staff, mfa_enabled, mfa_setup_required, memberships]
+      properties:
+        id: { type: string }
+        email: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [owner, editor, viewer, staff], description: role in the current tenant }
+        is_staff: { type: boolean }
+        mfa_enabled: { type: boolean }
+        mfa_setup_required: { type: boolean, description: "staff, or the tenant enforces MFA, and no TOTP yet: only enrolment calls are allowed" }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        idle_timeout_minutes: { type: integer }
+        support: { type: boolean, description: staff inside a tenant they are not a member of }
+        tenant:
+          type: [object, 'null']
+          properties:
+            slug: { type: string }
+            name: { type: string }
+            accent: { type: string }
+            accent_secondary: { type: [string, 'null'] }
+            locale_default: { type: string }
+            mfa_required: { type: boolean }
+            suspended: { type: boolean }
+        memberships: { type: array, items: { $ref: '#/components/schemas/MembershipRef' } }
+
+    Session:
+      type: object
+      required: [id, created_at, last_seen_at, expires_at, via, client, current]
+      properties:
+        id: { type: string }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        via: { type: string, description: "password, invite, reset or orven:<email>" }
+        client: { type: string, description: 'coarse, for example Chrome on macOS; no address is stored' }
+        tenant: { type: [string, 'null'], description: tenant slug }
+        current: { type: boolean }
+
+    Member:
+      type: object
+      required: [id, email, name, role, mfa_enabled, created_at, active_sessions]
+      properties:
+        id: { type: string }
+        email: { type: string }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/TenantRole' }
+        mfa_enabled: { type: boolean }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time, description: when the membership started }
+        active_sessions: { type: integer }
+
+    Invite:
+      type: object
+      required: [id, email, role, state, created_at, expires_at]
+      properties:
+        id: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [owner, editor, viewer, staff] }
+        state: { type: string, enum: [pending, accepted, expired, revoked] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        accepted_at: { type: [string, 'null'], format: date-time }
+        invited_by: { type: [string, 'null'], description: the inviter's email }
+
+    InviteInput:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string }
+        role: { $ref: '#/components/schemas/TenantRole' }
+        locale: { type: string, enum: [nl, en] }
+
+    InvitePreview:
+      type: object
+      required: [email, role, expires_at, existing_account, mfa_required]
+      properties:
+        email: { type: string }
+        name: { type: string, description: 'the name the inviter gave, if any' }
+        role: { type: string }
+        tenant:
+          type: [object, 'null']
+          properties:
+            slug: { type: string }
+            name: { type: string }
+            accent: { type: string }
+        expires_at: { type: string, format: date-time }
+        existing_account: { type: boolean }
+        mfa_required: { type: boolean }
+
+    SecuritySettings:
+      type: object
+      required: [mfa_required, idle_timeout_minutes, members_without_mfa]
+      properties:
+        mfa_required: { type: boolean }
+        idle_timeout_minutes: { type: integer }
+        members_without_mfa: { type: integer }
+
+    KeyInput:
+      type: object
+      required: [name, scope]
+      properties:
+        name: { type: string }
+        scope: { type: string, enum: [ingest, serve, admin] }
+        environment: { type: string, default: production }
+        expires_in_days: { type: integer, minimum: 1, maximum: 730 }
+
+    Account:
+      type: object
+      required: [id, email, name, is_staff, mfa_enabled, disabled, created_at, active_sessions, memberships]
+      properties:
+        id: { type: string }
+        email: { type: string }
+        name: { type: string }
+        is_staff: { type: boolean }
+        mfa_enabled: { type: boolean }
+        disabled: { type: boolean }
+        locked_until: { type: [string, 'null'], format: date-time }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        active_sessions: { type: integer }
+        memberships: { type: array, items: { $ref: '#/components/schemas/MembershipRef' } }
+
+    TenantInput:
+      type: object
+      required: [slug, name]
+      properties:
+        slug: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,39}$' }
+        name: { type: string }
+        accent: { type: string }
+        accent_secondary: { type: string }
+        locale_default: { type: string, enum: [nl, en] }
+        default_mode: { $ref: '#/components/schemas/Mode' }
+        daily_llm_budget_cents: { type: integer }
+        plan: { type: string, enum: [trial, standard, enterprise] }
+        request_quota_monthly: { type: integer, minimum: 1 }
+        seats: { type: integer, minimum: 1 }
+        owner_email: { type: string, description: the first owner; invited by email }
+        owner_name: { type: string }
+
+    StaffTenant:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        accent: { type: string }
+        accent_secondary: { type: [string, 'null'] }
+        locale_default: { type: string }
+        default_mode: { type: string }
+        daily_llm_budget_cents: { type: integer }
+        plan: { type: string, enum: [trial, standard, enterprise] }
+        request_quota_monthly: { type: [integer, 'null'] }
+        seats: { type: [integer, 'null'] }
+        mfa_required: { type: boolean }
+        created_at: { type: string, format: date-time }
+        suspended_at: { type: [string, 'null'], format: date-time }
+        usage:
+          type: object
+          properties:
+            requests_7d: { type: integer }
+            impressions_7d: { type: integer }
+            llm_cents_30d: { type: integer }
+            surfaces_live: { type: integer }
+            requests_30d: { type: integer, description: 'every logged slate, shadow included' }
+            impressions_30d: { type: integer, description: shown slates only }
+            items: { type: integer }
+            users: { type: integer, description: profiled end users (random ids) }
+            members: { type: integer, description: panel memberships }
+            keys_active: { type: integer }
+
+    PlatformHealth:
+      type: object
+      properties:
+        engine: { type: object, properties: { version: { type: string }, migrations: { type: array, items: { type: string } } } }
+        jobs:
+          type: object
+          properties:
+            version: { type: [string, 'null'] }
+            last_runs: { type: array, items: { type: object, properties: { tenant: { type: string }, job: { type: string }, at: { type: string, format: date-time }, status: { type: string } } } }
+        stores:
+          type: object
+          properties:
+            postgres_size_mb: { type: number }
+            last_dump_at: { type: [string, 'null'] }
+            wal_archived_count: { type: integer }
+            wal_last_archived_at: { type: [string, 'null'], format: date-time }
+        errors_1h: { type: integer, description: 5xx answered by this engine process in the last hour }
+        p99_ms_by_tenant: { type: object, additionalProperties: { type: [number, 'null'] } }
+        deletion_queue: { type: integer }
+
+    PlatformSettingsPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        providers: { type: object, description: "provider → options (no credentials)" }
+        model_pins: { type: object }
+        default_budget_cents: { type: integer }
+        retention_defaults: { type: object, additionalProperties: { type: integer } }
+        feature_flags: { type: object, additionalProperties: { type: boolean } }
+        prices:
+          type: array
+          items:
+            type: object
+            properties:
+              provider: { type: string }
+              model: { type: string }
+              input_usd_per_mtok: { type: number }
+              output_usd_per_mtok: { type: number }
+
+    PlatformSettings:
+      allOf:
+        - { $ref: '#/components/schemas/PlatformSettingsPatch' }
+        - type: object
+          properties:
+            prices:
+              type: array
+              items:
+                type: object
+                properties:
+                  provider: { type: string }
+                  model: { type: string }
+                  input_usd_per_mtok: { type: number }
+                  output_usd_per_mtok: { type: number }
+                  effective_from: { type: string, format: date }
+
+    # ---- panel backends ------------------------------------------------------------------------
+    ConnectorSource:
+      type: object
+      properties:
+        source: { type: string, enum: [backend, sdk, posthog, ga4, shopify, csv] }
+        status: { type: string, enum: [connected, failing, not_connected] }
+        health: { type: string, enum: [ok, failing, never] }
+        last_run: { oneOf: [{ $ref: '#/components/schemas/ConnectorSourceRun' }, { type: 'null' }] }
+        runs: { type: array, items: { $ref: '#/components/schemas/ConnectorSourceRun' }, description: the ten newest runs }
+        last_event_at: { type: [string, 'null'], format: date-time }
+        events_7d: { type: integer, description: events received from this source in 7 days (real rows) }
+        config:
+          type: object
+          properties:
+            webhook_url: { type: [string, 'null'] }
+            key_prefix: { type: [string, 'null'] }
+            docs_href: { type: string }
+
+    ConnectorSourceRun:
+      type: object
+      properties:
+        id: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        status: { type: string }
+        rows_in: { type: integer }
+        rows_mapped: { type: integer }
+        fields_dropped: { type: object, additionalProperties: { type: integer } }
+        error: { type: [string, 'null'] }
+
+    AlertTestResult:
+      type: object
+      properties:
+        notification_id: { type: string }
+        email: { type: string, enum: [queued, not_configured, unavailable], description: 'unavailable: no email outbox in this deployment' }
+        slack: { type: string, enum: [configured, not_configured] }
+
+    EnrichmentRun:
+      type: object
+      properties:
+        id: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [running, done, partial, failed] }
+        model: { type: [string, 'null'] }
+        items: { type: integer }
+        done: { type: integer }
+        failed: { type: integer }
+        retry_later: { type: integer }
+        tags_added: { type: integer }
+        cost_cents: { type: number }
+        stopped_reason: { type: [string, 'null'] }
+        item:
+          type: object
+          description: with ?external_id, that item's outcome in this run
+          properties:
+            external_id: { type: string }
+            kind: { type: string }
+            status: { type: string, enum: [done, failed, retry_later, stopped_budget] }
+            tags_added: { type: integer }
+            cost_usd: { type: number }
+            model: { type: string }
+            error: { type: string }
+
+    EnrichmentHistory:
+      type: object
+      properties:
+        model: { type: [string, 'null'], description: the newest run's tagging model }
+        runs_30d: { type: integer }
+        items_done_30d: { type: integer }
+        cost_cents_30d: { type: number }
+        runs: { type: array, items: { $ref: '#/components/schemas/EnrichmentRun' } }
+
+    GoldSetInput:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items:
+            type: object
+            required: [external_id, tags]
+            properties:
+              external_id: { type: string }
+              kind: { type: string, default: document }
+              tags: { type: array, items: { type: string } }
+        note: { type: string }
+
+    GoldSet:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              external_id: { type: string }
+              kind: { type: string }
+              title: { type: string }
+              gold: { type: array, items: { type: string } }
+              current: { type: array, items: { type: string }, description: approved tags now }
+              matched: { type: array, items: { type: string } }
+              extra: { type: array, items: { type: string }, description: current but not gold (false positives) }
+              missing: { type: array, items: { type: string }, description: gold but not current (false negatives) }
+              labelled_at: { type: string, format: date-time }
+        score: { $ref: '#/components/schemas/GoldScore' }
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              at: { type: string, format: date-time }
+              items: { type: integer }
+              matched: { type: integer }
+              extra: { type: integer }
+              missing: { type: integer }
+              precision: { type: [number, 'null'] }
+              recall: { type: [number, 'null'] }
+              f1: { type: [number, 'null'] }
+              scored_by: { type: [string, 'null'] }
+        sample:
+          type: array
+          items:
+            type: object
+            properties:
+              external_id: { type: string }
+              kind: { type: string }
+              title: { type: string }
+              collection: { type: string }
+              current: { type: array, items: { type: string } }
+
+    GoldScore:
+      type: object
+      description: micro-averaged over every labelled (item, tag) pair; null when the denominator is zero
+      properties:
+        items: { type: integer }
+        matched: { type: integer }
+        extra: { type: integer }
+        missing: { type: integer }
+        precision: { type: [number, 'null'] }
+        recall: { type: [number, 'null'] }
+        f1: { type: [number, 'null'] }
+
+    BulkItemsInput:
+      type: object
+      required: [external_ids]
+      properties:
+        external_ids: { type: array, minItems: 1, maxItems: 500, items: { type: string } }
+        kind: { type: string, description: empty matches every kind carrying the id }
+        status: { type: string, enum: [draft, scheduled, published, archived] }
+        collection: { type: string }
+        add_tags: { type: array, items: { type: string } }
+        remove_tags: { type: array, items: { type: string } }
+        approve_tags: { type: boolean }
+        re_enrich: { type: boolean }
+        note: { type: string }
+
+    BulkItemsResult:
+      type: object
+      properties:
+        matched: { type: integer }
+        updated: { type: integer, description: items with at least one change }
+        not_found: { type: array, items: { type: string } }
+        approvals_requested: { type: integer }
+        re_enrich_queued: { type: integer }
+
+    CohortStats:
+      type: object
+      properties:
+        users: { type: integer }
+        share: { type: [number, 'null'], description: of all profiled users }
+        impressions: { type: integer }
+        seen: { type: integer }
+        taps: { type: integer }
+        tap_rate: { type: [number, 'null'], description: taps over seen }
+
+    Cohorts:
+      type: object
+      properties:
+        days: { type: integer }
+        users: { type: integer, description: profiled users in the data set }
+        goals:
+          type: array
+          items:
+            allOf:
+              - { $ref: '#/components/schemas/CohortStats' }
+              - type: object
+                properties:
+                  goal: { type: string }
+                  top_personas: { type: array, items: { type: object, properties: { persona: { type: string }, users: { type: integer } } } }
+        personas:
+          type: array
+          items:
+            allOf:
+              - { $ref: '#/components/schemas/CohortStats' }
+              - type: object
+                properties:
+                  persona: { type: string }
+
+    ConsentTimeline:
+      type: object
+      properties:
+        weeks:
+          type: array
+          items:
+            type: object
+            properties:
+              week_start: { type: string, format: date }
+              personalized: { type: integer }
+              cohort: { type: integer }
+              non_profiled: { type: integer }
+              total: { type: integer }
+        totals:
+          type: object
+          properties:
+            personalized: { type: integer }
+            cohort: { type: integer }
+            non_profiled: { type: integer }
+
+    Heatmap:
+      type: object
+      properties:
+        surface: { type: string }
+        days: { type: integer }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        slots:
+          type: array
+          items:
+            type: object
+            properties:
+              position: { type: integer }
+              impressions: { type: integer }
+              seen: { type: integer }
+              taps: { type: integer }
+              seen_rate: { type: [number, 'null'] }
+              tap_rate: { type: [number, 'null'] }
+              explored_share: { type: [number, 'null'] }
+              reasons: { type: object, additionalProperties: { type: integer } }
+        cells:
+          type: array
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              position: { type: integer }
+              impressions: { type: integer }
+              seen: { type: integer }
+              taps: { type: integer }
+              seen_rate: { type: [number, 'null'] }
+              tap_rate: { type: [number, 'null'] }
+
+    AnnotationInput:
+      type: object
+      required: [at, text]
+      properties:
+        surface: { type: [string, 'null'] }
+        at: { type: string, description: date or RFC 3339 time }
+        text: { type: string, minLength: 1, maxLength: 500 }
+
+    Annotation:
+      type: object
+      properties:
+        id: { type: string, description: 'a note id, or audit:<n> for a change from the audit log' }
+        source: { type: string, enum: [note, audit] }
+        kind: { type: string, enum: [note, flow_activated, status_changed, surface_created, experiment_started, experiment_ended, paused, resumed] }
+        surface: { type: [string, 'null'] }
+        at: { type: string, format: date-time }
+        text: { type: string }
+        author: { type: [string, 'null'] }
+        author_email: { type: [string, 'null'] }
+
+    PresenceEntry:
+      type: object
+      properties:
+        user_id: { type: string }
+        email: { type: string }
+        role: { type: string }
+        path: { type: string }
+        last_seen: { type: string, format: date-time }
+
+    ReportSend:
+      type: object
+      properties:
+        id: { type: string }
+        report_id: { type: string }
+        trigger: { type: string, enum: [manual, schedule] }
+        status: { type: string, enum: [queued, sending, sent, failed] }
+        recipients: { type: integer }
+        requested_by: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        sent_at: { type: [string, 'null'], format: date-time }
+        error: { type: [string, 'null'] }
+
+    WorkspaceExport:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [done, failed] }
+        files: { type: array, items: { type: string } }
+        bytes: { type: integer }
+        download_url: { type: string, description: path under /v1 }
+
+    WorkspaceDeletion:
+      type: object
+      properties:
+        state: { type: string, enum: [scheduled, pending_approval] }
+        scheduled_for: { type: [string, 'null'], format: date-time }
+        approval: { $ref: '#/components/schemas/Approval' }
+
+    AnalystNote:
+      type: object
+      properties:
+        id: { type: string }
+        week_start: { type: string, format: date }
+        created_at: { type: string, format: date-time }
+        model: { type: [string, 'null'] }
+        headline: { type: string }
+        sections:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string, enum: [moved, steady, try] }
+              text: { type: string }
+              figures: { type: array, items: { type: string }, description: figure names cited in the text (link targets) }
+        figures: { type: object, additionalProperties: { type: number }, description: the inputs every number in the note was checked against }

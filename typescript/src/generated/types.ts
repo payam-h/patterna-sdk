@@ -27,7 +27,15 @@ export interface paths {
          *
          *     Errors that are not fallbacks (fix the request): 400, 404 `unknown_surface`, 422
          *     `mode_conflict`. Errors where the caller shows its own list: 409 `surface_off`, 422
-         *     `no_candidates` (nothing left after the filters), 429, 5xx.
+         *     `no_candidates` (nothing left after the filters and the surface's fallback list is empty
+         *     too), 429, 5xx.
+         *
+         *     Arms: in `control` the slate is the editor's list for this page (see
+         *     `context.control_item_ids` and the surface's `fallback.by_anchor`), under the same rules
+         *     as treatment. A ranked slate shorter than `slots` is filled from that list behind the
+         *     ranked items (`fill_count`). A `personalized` or `cohort` request for a user who opted out
+         *     (`PUT /users/{id}/mode non_profiled`) is served as `non_profiled` and logged without the
+         *     user id. `shown: false` answers carry no items: hide the block, do not abandon it.
          */
         post: operations["recommend"];
         delete?: never;
@@ -50,7 +58,8 @@ export interface paths {
          * @description Flags the impression `fallback: true, client_abandoned: true`. It counts in the fallback
          *     rate and stays in its arm in the ledger (intention to treat: dropping it would flatter the
          *     slower arm). Idempotent. Call it when the client's deadline passed, or when the app hid
-         *     the block for its own reasons.
+         *     the block for its own reasons. A slate answered `shown: false` is never abandoned (409
+         *     `not_shown`): it already counts in its arm with zero taps.
          */
         post: operations["abandonRecommendation"];
         delete?: never;
@@ -74,7 +83,9 @@ export interface paths {
          *     `details.unknown_item_ids`). The item's kind and served position come from the logged
          *     slate; a client `kind` is ignored. On a surface with `device_resort` every interaction must
          *     carry `displayed_position` (422 `displayed_position_required`). Report only for users who
-         *     allowed usage analytics; the others are requested with `context.measured: false`.
+         *     allowed usage analytics; the others are requested with `context.measured: false`. A `seen`
+         *     with `block` records that the slate was seen in that block (`blocks_shown`), which feeds
+         *     the per-block ledger rows and surface metrics.
          */
         post: operations["reportInteractions"];
         delete?: never;
@@ -198,6 +209,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/users/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Consent-mode split, persona mix and active people for the Audiences screen
+         * @description Counts only, never a user id. Non-profiled traffic has no user rows, so it is counted in
+         *     distinct sessions over the last 30 days; `daily_users` counts distinct randomised units
+         *     (user or session) served per day, oldest first.
+         */
+        get: operations["usersSummary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users/{user_id}/mode": {
         parameters: {
             query?: never;
@@ -209,8 +242,13 @@ export interface paths {
         /**
          * Set a user's consent mode
          * @description Ingest key (the customer's backend owns consent) or admin key. Switching to
-         *     `non_profiled` deletes the user row at once, keeps a salted opt-out marker and queues model
-         *     retraining.
+         *     `non_profiled` deletes the user row at once, keeps a salted opt-out marker and queues a
+         *     deletion request that stores only the salted hash (`sha256:…`), exactly like
+         *     `DELETE /users/{id}`: the jobs then unlink the user's impressions (kept for the ledger,
+         *     matched by the unit hash, never deleted) and delete events, assignments and shortlists,
+         *     and retraining follows. From that moment serve answers this user's profiled requests as
+         *     `non_profiled`, logged without the id. The call creates the user row for `personalized`
+         *     and `cohort`.
          */
         put: operations["setUserMode"];
         post?: never;
@@ -232,7 +270,8 @@ export interface paths {
          * Set the user's declared attributes as tag affinities
          * @description Ingest or admin key. Goals, activity, stress, wearable, premium flag. Never health values.
          *     422 `mode_conflict` for a `non_profiled` user (or one who opted out) unless the body sets
-         *     the mode explicitly.
+         *     the mode explicitly. A profile never creates consent: without `mode`, a user Patterna has
+         *     no row for is 422 `mode_required`; an existing user keeps their mode.
          */
         put: operations["setUserProfile"];
         post?: never;
@@ -507,8 +546,12 @@ export interface paths {
         /**
          * The proof ledger
          * @description Without `bucket`: one summary row per surface with the user-clustered interval. With
-         *     `bucket=week`: weekly rows per arm for the chart (Wilson intervals per impression, UTC weeks
-         *     from Monday; default the last 12 weeks).
+         *     `bucket=week`: weekly rows per arm for the chart, read with the summary row's rules (the
+         *     experiment's window, `unit_hash`, every served slate, a tap is a slate with a tap; Wilson
+         *     intervals per slate, UTC weeks from Monday; default the last 12 weeks). With `by=block`
+         *     (every block) or `block=<name>`: one row per surface and block, over the slates the client
+         *     reported seen in that block and taps in that block (`tap_rate`); descriptive, the
+         *     whole-slate row decides.
          */
         get: operations["ledger"];
         put?: never;
@@ -2374,6 +2417,10 @@ export interface components {
                  * @default true
                  */
                 measured?: boolean;
+                /** @description the customer's own editorial list for this page (an article's pairs-with products, the editor's related articles). In the control arm it is the slate, in this order, under the request's rules (never the anchor, excluded ids, joined communities, other kinds; the premium policy), logged with control_source request; newest items fill the rest. In treatment it is the list short slates are filled from. */
+                control_item_ids?: string[];
+                /** @description community ids the user is in, for requests without an identity (non_profiled): never offered. In personalized and cohort mode membership also comes from community_joined/community_left events. */
+                member_of?: string[];
             };
             slots?: number;
             exclude_item_ids?: string[];
@@ -2394,9 +2441,16 @@ export interface components {
             items: components["schemas"]["SlateItem"][];
             /** @description true when the non-personalized list was returned as the safety net (timeout, storage trouble, no active flow) */
             fallback?: boolean;
-            /** @description false when the slate has fewer items than the surface's min_slots: hide the block. Such a slate is logged as not shown and stays out of the ledger and the metrics. */
+            /** @description false when fewer items than the surface's min_slots pass the request's rules (counted before the arm, so both arms hide alike). The answer then carries no items: hide the block and do not abandon the slate (409 not_shown). It stays in its arm in the ledger as a served slate with zero taps (intention to treat). */
             shown?: boolean;
             latency_ms?: number;
+            /**
+             * @description editorial slates only: the request's control_item_ids, the surface's fallback.by_anchor list for the anchor, or the surface's own list
+             * @enum {string}
+             */
+            control_source?: "request" | "by_anchor" | "surface";
+            /** @description trailing positions filled from the editorial list because the ranked candidates ran out (generator fallback, propensity 1); absent when 0 */
+            fill_count?: number;
         };
         SlateItem: {
             /** @description the customer's external id */
@@ -2428,7 +2482,7 @@ export interface components {
             };
             generator?: string;
             score?: number;
-            /** @description phase tags for on-device re-sorting; never used server-side */
+            /** @description phase tags from the item's catalog attributes, for on-device re-sorting; never used server-side. Sent only when the tenant turned phase_tags on (Settings; off by default). */
             phase_fit?: string[];
         };
         Interaction: {
@@ -2439,7 +2493,7 @@ export interface components {
             position: number;
             /** @description where the app showed it (0-based), when it re-sorted on the device; required on a device_resort surface */
             displayed_position?: number;
-            /** @description which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace */
+            /** @description which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace. A seen with a block records the block on the impression (per-block ledger rows). */
             block?: string;
             /** @enum {string} */
             type: "seen" | "click" | "dismiss";
@@ -2581,8 +2635,15 @@ export interface components {
             name?: string;
             item_kinds?: string[];
             slots?: number;
-            /** @description { kind: newest | curated, item_ids: [] } */
-            fallback?: Record<string, unknown>;
+            /** @description The surface's editorial list: the control arm, the rollout gate, the safety net and the fill for short slates. kind newest, popular (7-day) or curated (item_ids, in order); by_anchor maps an anchor's external id to the editor's list for that page (used when the request's anchor_item_id is a key). The request's own context.control_item_ids wins over both. */
+            fallback?: {
+                /** @enum {string} */
+                kind?: "newest" | "popular" | "curated";
+                item_ids?: string[];
+                by_anchor?: {
+                    [key: string]: string[];
+                };
+            };
             exploration_share?: number;
             /** @enum {string} */
             status?: "shadow" | "testers" | "live" | "off";
@@ -2592,7 +2653,7 @@ export interface components {
             notes?: string;
             /** @description the app re-sorts the slate on the device. Allowed under a holdout (both arms are re-sorted by the same rule, the ledger stays intention to treat on served slates); every interaction must then carry displayed_position. PATCH only. */
             device_resort?: boolean;
-            /** @description a slate shorter than this after the filters is returned with shown=false and logged as not shown (outside the ledger and metrics). 0 = always shown. PATCH only. */
+            /** @description below this many items passing the request's rules (exclusions, anchor, joined communities, candidate kinds, premium, freshness; counted before the arm) the answer is shown=false with no items, logged not_shown, and counted in its arm with zero taps. 0 = always shown. PATCH only. */
             min_slots?: number;
         };
         Surface: components["schemas"]["SurfaceInput"] & {
@@ -2717,13 +2778,21 @@ export interface components {
              *     join_rate (surfaces that serve communities, else 400 metric_not_applicable): a
              *     community_joined for a community in the slate within 7 days, by the slate's user,
              *     session or request. engaged_after_tap: item_engaged or item_completed for a tapped item
-             *     within 7 days of the tap, same identity match. Unmeasured and not-shown slates are
-             *     outside every metric.
+             *     within 7 days of the tap, same identity match. Unmeasured slates are outside every
+             *     metric; a not-shown slate counts as served with no success.
              * @enum {string}
              */
             primary_metric: "tap_rate" | "second_item_rate" | "join_rate" | "engaged_after_tap";
-            /** @default persona */
-            stratify_by?: string;
+            /**
+             * @description persona: each persona stratum (none for requests without a persona) is hashed on its own against its share
+             * @default none
+             * @enum {string}
+             */
+            stratify_by?: "none" | "persona";
+            /** @description treatment share per persona stratum (stratify_by persona only); a stratum not listed uses treatment_share. The SRM check expects the assignment-weighted share. */
+            strata_shares?: {
+                [key: string]: number;
+            };
             baseline_rate?: number;
             /** @description the change to detect, e.g. 0.2 */
             relative_change?: number;
@@ -2763,8 +2832,12 @@ export interface components {
             /** @description sample-ratio-mismatch p-value; below 0.001 the row must not be read */
             srm_p?: number;
             note?: string;
-            /** @description false below the readable sample; interval shown dashed */
+            /** @description each arm has at least readable_sample units and the interval exists; interval shown dashed otherwise */
             readable?: boolean;
+            /** @description units per arm from the power calculation (alpha 0.05, power 0.8) on the experiment's planned baseline and relative change; without a baseline the observed control rate, without a change 20%; 0 while the control rate is 0 */
+            readable_sample?: number;
+            /** @description per-block rows only (by=block or block=) */
+            block?: string;
             revenue_cents_control?: number | null;
             revenue_cents_treatment?: number | null;
             export_uri?: string | null;
@@ -2821,7 +2894,10 @@ export interface components {
         };
         AuditEntry: {
             id?: number;
+            /** @description panel user id; null for the system and API keys */
             actor?: string | null;
+            /** @description the panel user's sign-in email, for display */
+            actor_email?: string | null;
             action?: string;
             target?: string;
             diff?: Record<string, unknown> | null;
@@ -2863,6 +2939,7 @@ export interface components {
                 /** Format: date-time */
                 at?: string;
                 actor?: string | null;
+                actor_email?: string | null;
                 action?: string;
                 target?: string;
             }[];
@@ -2883,6 +2960,10 @@ export interface components {
                 unmeasured_share?: number | null;
                 p99_ms?: number | null;
                 explored_share?: number | null;
+                /** @description slates answered shown:false over all slates (they are in the ledger with zero taps, not in the other rates) */
+                not_shown_share?: number | null;
+                /** @description echoed when the block filter is set */
+                block?: string;
             }[];
         };
         PreviewRequest: {
@@ -2896,6 +2977,21 @@ export interface components {
             flow_version?: number;
             slots?: number;
         };
+        UsersSummary: {
+            window_days?: number;
+            /** @description profiled users seen in the window */
+            active_users?: number;
+            modes?: {
+                personalized?: number;
+                cohort?: number;
+                non_profiled_sessions_30d?: number;
+            };
+            /** @description persona → users */
+            personas?: {
+                [key: string]: number;
+            };
+            daily_users?: number[];
+        };
         Preview: {
             slate?: components["schemas"]["Slate"];
             /** @description item id → generator → contribution */
@@ -2903,6 +2999,10 @@ export interface components {
                 [key: string]: {
                     [key: string]: number;
                 };
+            };
+            /** @description item id → the logged probability that the policy put this item in its slot */
+            propensities?: {
+                [key: string]: number;
             };
         };
         CuratedItem: {
@@ -2962,13 +3062,14 @@ export interface components {
             surface?: string;
             /** @enum {string} */
             arm?: "control" | "treatment";
-            /** @description impressions reported as seen */
+            /** @description slates served in the experiment's window (shown or not, seen or not: intention to treat) */
             impressions?: number;
+            /** @description slates with at least one tap */
             taps?: number;
             rate?: number;
             lo?: number;
             hi?: number;
-            /** @description randomised units with a seen impression that week */
+            /** @description randomised units (unit_hash) served that week */
             users?: number;
         };
         Power: {
@@ -3065,6 +3166,8 @@ export interface components {
             /** @enum {string} */
             premium_policy_default?: "allow" | "cap" | "exclude";
             two_person_rule?: boolean;
+            /** @description serve phase_fit item metadata in slates (off by default) */
+            phase_tags?: boolean;
             /** Format: date-time */
             suspended_at?: string | null;
             paused?: boolean;
@@ -3125,6 +3228,8 @@ export interface components {
             /** @enum {string} */
             premium_policy_default?: "allow" | "cap" | "exclude";
             two_person_rule?: boolean;
+            /** @description turn phase_fit item metadata on in slates and the importer */
+            phase_tags?: boolean;
             webhooks?: components["schemas"]["WebhookEndpoint"][];
             /** @description 24 to 200 random characters the PostHog destination sends in X-Patterna-Token; stored as its SHA-256; empty removes it */
             posthog_token?: string;
@@ -3189,6 +3294,10 @@ export interface components {
             requested_by?: string | null;
             /** @description the deciding user (also on rejection) */
             approved_by?: string | null;
+            /** @description the requester's sign-in email, for display */
+            requested_by_email?: string | null;
+            /** @description the decider's sign-in email, for display */
+            approved_by_email?: string | null;
             /** @enum {string} */
             state?: "pending" | "approved" | "rejected";
             decision_note?: string;
@@ -4031,6 +4140,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     reportInteractions: {
@@ -4284,6 +4394,30 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    usersSummary: {
+        parameters: {
+            query?: {
+                /** @description true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both. */
+                include_synthetic?: components["parameters"]["IncludeSynthetic"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ok */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsersSummary"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
         };
     };
     setUserMode: {
@@ -4724,6 +4858,10 @@ export interface operations {
                 from?: string;
                 to?: string;
                 bucket?: "week";
+                /** @description one row per surface and block */
+                by?: "block";
+                /** @description one block only */
+                block?: string;
                 /** @description true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both. */
                 include_synthetic?: components["parameters"]["IncludeSynthetic"];
             };
@@ -4914,6 +5052,7 @@ export interface operations {
                 actor?: string;
                 from?: string;
                 to?: string;
+                /** @description the id of the last entry already read; the next page holds older entries */
                 cursor?: string;
             };
             header?: never;
@@ -4962,6 +5101,8 @@ export interface operations {
         parameters: {
             query?: {
                 days?: number;
+                /** @description only slates seen in this block, and taps in it */
+                block?: string;
                 /** @description true selects only the example data set (rows flagged synthetic); the default selects only real rows. Never both. */
                 include_synthetic?: components["parameters"]["IncludeSynthetic"];
             };
@@ -7412,7 +7553,13 @@ export interface operations {
                         status?: string;
                         postgres?: string;
                         redis?: string;
+                        /** @description the release (commit) */
                         version?: string;
+                        /**
+                         * @description the API version this engine serves (info.version); GET /healthz outside /v1 reports {status, release, engine_version} too
+                         * @example 0.2.0
+                         */
+                        engine_version?: string;
                     };
                 };
             };

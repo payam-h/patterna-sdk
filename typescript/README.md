@@ -1,8 +1,18 @@
-# @patterna/sdk
+# patterna-sdk
 
-Version 0.2.0 (see `CHANGELOG.md`). Features marked **engine 0.2** need the engine release that
-adds the matching endpoint, header or field; against an older engine they are ignored or answer
-404.
+Version 0.2.0 (see `CHANGELOG.md`). Needs engine 0.2 or later, which is the engine in production.
+
+**Install.** The npm name is `patterna-sdk`, and it is not published yet: `npm install
+patterna-sdk` returns 404 today. Until it is, build it from the public repository
+[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.2.0`:
+
+```sh
+git clone --branch v0.2.0 https://github.com/payam-h/patterna-sdk.git
+cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.2.0.tgz
+cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.2.0.tgz
+```
+
+In this monorepo the package is `@patterna/sdk` (private); the release script renames it.
 
 TypeScript client for the Patterna API. One package for three places:
 
@@ -36,7 +46,7 @@ npm run check     # tsc --noEmit + eslint + vitest + tsup build
 ## The client
 
 ```ts
-import { PatternaClient } from "@patterna/sdk";
+import { PatternaClient } from "patterna-sdk";
 
 const patterna = new PatternaClient({
   baseUrl: "https://patterna-api.orven.am/v1",
@@ -57,9 +67,9 @@ const patterna = new PatternaClient({
 | `setUserProfile(userId, profile)` | admin key if set, else ingest | 5 s | once |
 | `deleteUser(userId)` | admin key if set, else ingest | 5 s | once |
 | `recommendWithFallback(req, fallback)`, `recommendMany(reqs)` | serve | 150 ms | never |
-| `abandon(requestId, reason)` (engine 0.2) | serve | 5 s | once |
-| `deleteItem`, `listItems`, `itemsChangedSince` (engine 0.2) | ingest | 5 s | once |
-| `createSigningSecret` (engine 0.2) and the admin methods below | admin | 30 s | idempotent ones once |
+| `abandon(requestId, reason)` | serve | 5 s | once |
+| `deleteItem`, `listItems`, `itemsChangedSince` | ingest | 5 s | once |
+| `createSigningSecret` and the admin methods below | admin | 30 s | idempotent ones once |
 
 Budgets are per attempt and can be changed per client (`timeouts: { recommendMs, ingestMs,
 adminMs }`) or per call (`{ timeoutMs, signal }`). The single retry fires on 5xx and network
@@ -68,17 +78,18 @@ already spent.
 
 Per-call options also take `requestId` (sent as `x-request-id`; minted otherwise), `traceId`
 (`x-trace-id`, overriding the client's `traceId()`) and, on `recommend`, `tester: true`
-(`x-patterna-tester: 1`, engine 0.2).
+(`x-patterna-tester: 1`).
 
 ### Deadlines, request ids and abandonment
 
-- `recommend` sends `x-deadline-ms` (engine 0.2): 120 ms by default
-  (`timeouts.recommendDeadlineMs`, always below `recommendMs`), so the engine serves its own
+- `recommend` sends `x-deadline-ms`: 120 ms by default
+  (`timeouts.recommendDeadlineMs`, always below `recommendMs`; the engine's own default budget is
+  120 ms too), so the engine serves its own
   fallback in time instead of answering after the client gave up. A shorter `timeoutMs` shrinks
   it by the same margin: `timeoutMs: 80` sends 50.
 - The client mints the request id, so it knows it even when no slate comes back.
   `recommendWithFallback` uses that: on a timeout, network error, 5xx or unreadable answer it
-  sends `POST /recommendations/{id}/abandon` in the background (engine 0.2), and the impression
+  sends `POST /recommendations/{id}/abandon` in the background, and the impression
   counts as a client fallback instead of a slate with zero taps. A 4xx (nothing was logged) is not
   abandoned. Failures of that background call go to `onBackgroundError`.
 
@@ -101,13 +112,13 @@ ledger row you cannot split later.
 
 ### Interactions: kind, re-sorting and split blocks
 
-- `kind` is required for anything that is not a document (engine 0.2 refuses it otherwise). For
+- `kind` is required for anything that is not a document. For
   slates this client served, an interaction without `kind` on a community, product, event or tip
   throws `ValidationError` before sending. `interactionFor(slate, itemId, type)` fills `kind` and
   `position`.
 - `displayed_position`: when the app re-sorts on the device, keep `position` as the served slot
   and set `displayed_position` to where it was shown.
-- `block` (engine 0.2): when one slate is split across UI blocks, name the block. A slate of 7
+- `block`: when one slate is split across UI blocks, name the block. A slate of 7
   shown as a top slot plus an end carousel of six: request `slots: 7`, render `items[0]` on top
   and `items.slice(1)` in the carousel, and report with the served positions:
 
@@ -125,9 +136,9 @@ await patterna.reportInteractions(s.request_id, report);
 
 ### Consent: measured and assignment unit
 
-- `measuredContext(context, analyticsConsent)` sets `measured` (engine 0.2): `false` keeps the
+- `measuredContext(context, analyticsConsent)` sets `measured`: `false` keeps the
   request out of the ledger and the training data; the slate is still ranked and shown.
-- `assignment_unit` (engine 0.2) keeps one non-profiled person in one holdout arm across rotating
+- `assignment_unit` keeps one non-profiled person in one holdout arm across rotating
   sessions: `assignment_unit: await assignmentUnit(experimentSecret, yourUserId)` on the backend.
   The secret never leaves you; only the 64-hex shape is accepted, so a raw id cannot slip through.
   Same function and test vector in the Go and Python SDKs.
@@ -135,8 +146,8 @@ await patterna.reportInteractions(s.request_id, report);
 ### Catalog reconciliation
 
 ```ts
-for await (const item of patterna.itemsChangedSince(lastRun)) reconcile(item); // engine 0.2
-await patterna.deleteItem("community", "community_42");                         // engine 0.2
+for await (const item of patterna.itemsChangedSince(lastRun)) reconcile(item);
+await patterna.deleteItem("community", "community_42");
 ```
 
 ### Admin (admin key)
@@ -145,7 +156,7 @@ For CI scripts that keep flow configs in your repository: `listSurfaces`, `getSu
 `setSurfaceStatus`, `setSurfaceTesters`, `listFlows`, `getFlow`, `createFlow`, `activateFlow`,
 `rollbackFlow`, `planFlow`, `applyFlow(surface, config, { note, activate })`,
 `listExperiments`, `startExperiment`, `endExperiment`, `ledger`, `ledgerWeeks`,
-`exportLedger`, `exportStatus`, `createSigningSecret` (engine 0.2), `rotateSigningSecret`.
+`exportLedger`, `exportStatus`, `createSigningSecret`, `rotateSigningSecret`.
 `applyFlow` compares configs as canonical JSON: nothing happens when the active version
 matches. The Go SDK ships the same as a CLI (`packages/sdk-go/cmd/patterna`).
 
@@ -189,7 +200,7 @@ try {
 ### Fallback
 
 ```ts
-import { withFallback } from "@patterna/sdk";
+import { withFallback } from "patterna-sdk";
 
 const r = await withFallback(
   () => patterna.recommend({ surface: "home_articles", mode, user_id, context: { locale: "nl" } }),
@@ -207,7 +218,7 @@ narrows it to timeouts. Report interactions only when `r.source === "patterna"`.
 ### Signing
 
 ```ts
-import { signEvent } from "@patterna/sdk";
+import { signEvent } from "patterna-sdk";
 const signed = await signEvent(event, process.env.PATTERNA_SIGNING_SECRET!);
 ```
 
@@ -227,7 +238,7 @@ the same SDK works on both sides.
 
 ```ts
 import { Hono } from "hono";
-import { PatternaClient, withFallback, ValidationError, ConsentError, type Event } from "@patterna/sdk";
+import { PatternaClient, withFallback, ValidationError, ConsentError, type Event } from "patterna-sdk";
 
 const patterna = new PatternaClient({
   baseUrl: process.env.PATTERNA_URL!,
@@ -271,7 +282,7 @@ app.post("/patterna/events", async (c) => {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import "react-native-get-random-values"; // crypto.getRandomValues for newSessionId on Hermes
 import { AppState } from "react-native";
-import { EventQueue, PatternaClient, newSessionId, withFallback } from "@patterna/sdk";
+import { EventQueue, PatternaClient, newSessionId, withFallback } from "patterna-sdk";
 
 // Talks to YOUR backend proxy above, authenticated as the signed-in user. No Patterna key here.
 const patterna = new PatternaClient({
@@ -327,6 +338,12 @@ runtime, opaque-user-id checks, `withFallback`, `EventQueue` (bounded, persisten
 AsyncStorage-shaped store, consent-aware, idempotent restore), HMAC signing with a cross-language
 vector, assignment units, session ids. 95 tests with mocked fetch. ESM + CJS + d.ts via tsup.
 
+The request and slate types come from the contract (`src/generated/types.ts`, API 0.2.0), so
+`context.control_item_ids` (the caller's own editorial list, the control slate for this page),
+`context.member_of` (communities to exclude) and the answer's `control_source` and `fill_count`
+are typed. A `shown: false` answer is a normal 200 and is never abandoned: the SDK abandons only
+after a timeout, a network error or a 5xx.
+
 Deliberately left out:
 
 - Admin endpoints beyond surfaces, flows, experiments, ledger and the signing secret (keys,
@@ -335,13 +352,10 @@ Deliberately left out:
   the per-call budget are enough.
 - No persistent queue for abandonments: they are fire-and-forget promises. In a backend that
   shuts down, a few may be lost; the Go SDK drains its queue on `Close`.
-- Not published to npm (`private: true`) until the package name and registry are decided; this
-  0.2.0 is installed from the repository.
+- Not on npm yet: publishing `patterna-sdk` 0.2.0 is pending. Build it from the public
+  repository as shown at the top.
 
-Open questions (also in `docs/ISSUES.md`):
-
-1. Which key scope may call `/users/{id}/mode|profile` and `DELETE /users/{id}`? The contract tags
-   them `admin`; a customer backend should not need an admin key. The SDK uses the admin key when
-   configured and the ingest key otherwise.
-2. The engine must verify signatures over the canonical form above; it is not yet written into
-   the contract.
+Settled since 0.1: the user endpoints (`/users/{id}/mode`, `/users/{id}/profile`,
+`DELETE /users/{id}`) accept the ingest key (the SDK uses the admin key when configured, else the
+ingest key), and the engine verifies signatures over the canonical form above, as written in
+`contracts/events.md`.

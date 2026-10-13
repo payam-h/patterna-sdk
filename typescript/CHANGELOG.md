@@ -1,11 +1,17 @@
-# Changelog: @patterna/sdk
+# Changelog: patterna-sdk
 
-"Engine 0.2" marks features that need the engine release that adds the matching endpoint,
-header or field; against an older engine they are ignored or answer 404.
+SDK 0.2 needs engine 0.2 or later (the engine in production since release `7a7683e`).
 
-The package is still `private: true`: it is not published to npm until the package name and
-registry are decided. Install it from the repository (`npm install ../patterna/packages/sdk-ts`,
-or a git dependency on a tag) until then.
+Published as `patterna-sdk` from [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk)
+(`typescript/`). The npm publish is pending: `npm install patterna-sdk` returns 404 today. Until
+then build it from that repository at tag `v0.2.0` (`npm ci && npm run build && npm pack` in
+`typescript/`) and install the tarball.
+
+## Unreleased
+
+- Generated types follow contract 0.2.0 (engine 0.3): `context.control_item_ids`,
+  `context.member_of`, `control_source` and `fill_count` are typed. A `shown: false` answer (no
+  items) is a normal 200 and is never abandoned; abandoning it would answer 409 `not_shown`.
 
 ## 0.2.0 (2026-10-13)
 
@@ -15,24 +21,24 @@ or a git dependency on a tag) until then.
   `{ requestId }` gives one; timeout, network and abort errors carry it.
 - **`recommendWithFallback(req, fallback, opts)`** returns `{ source, value, requestId }` and, on
   a fallback, `error` and `abandoned`. On a timeout, network error, 5xx or unreadable answer it
-  reports the abandonment in the background (engine 0.2,
-  `POST /recommendations/{id}/abandon`); failures go to `onBackgroundError`. `abandon(id, reason)`
+  reports the abandonment in the background
+  (`POST /recommendations/{id}/abandon`); failures go to `onBackgroundError`. `abandon(id, reason)`
   for a slate that arrived but was not shown.
-- **Server deadline** (engine 0.2): `x-deadline-ms` on `recommend`, 120 ms by default
+- **Server deadline**: `x-deadline-ms` on `recommend`, 120 ms by default
   (`timeouts.recommendDeadlineMs`), shrunk by the same margin when `timeoutMs` is shorter.
 - **Trace ids**: `x-trace-id` from `{ traceId }` per call or the client's `traceId()`.
-- **Testers** (engine 0.2): `{ tester: true }` sends `x-patterna-tester: 1`.
-- **`assignment_unit`** (engine 0.2) on recommend requests and `assignmentUnit(secret, userId)`
+- **Testers**: `{ tester: true }` sends `x-patterna-tester: 1`.
+- **`assignment_unit`** on recommend requests and `assignmentUnit(secret, userId)`
   with the cross-language vector; only the 64-hex shape is accepted.
-- **`measured`** (engine 0.2) on the request context and `measuredContext(context, analyticsConsent)`.
+- **`measured`** on the request context and `measuredContext(context, analyticsConsent)`.
 - **Interactions**: `kind` checked, and required for non-documents of slates this client
-  served (`slateMemory`, default 4096); `block` (engine 0.2); positions checked;
+  served (`slateMemory`, default 4096); `block`; positions checked;
   `interactionFor(slate, itemId, type)`.
 - **`recommendMany`**: several surfaces in parallel with one budget.
 - **Typed API codes**: `ApiErrorCode`, `isApiError`, `isCallerBug`. `withFallback` and
   `recommendWithFallback` rethrow `pii_rejected` and `mode_conflict`.
-- **Catalog** (engine 0.2): `deleteItem`, `listItems({ changedSince })`, `itemsChangedSince`.
-- **Admin methods** (admin key): `createSigningSecret` (engine 0.2), `rotateSigningSecret`,
+- **Catalog**: `deleteItem`, `listItems({ changedSince })`, `itemsChangedSince`.
+- **Admin methods** (admin key): `createSigningSecret`, `rotateSigningSecret`,
   `listSurfaces`, `getSurface`, `setSurfaceStatus`, `setSurfaceTesters`, `listFlows`, `getFlow`,
   `createFlow`, `activateFlow`, `rollbackFlow`, `planFlow`, `applyFlow`, `listExperiments`,
   `startExperiment`, `endExperiment`, `ledger`, `ledgerWeeks`, `exportLedger`, `exportStatus`.

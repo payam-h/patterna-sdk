@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Patterna API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Proof-first recommendation platform. Three key scopes: `serve` (recommendations and
     interactions; keys start `pk_s_`), `ingest` (events, catalog, user consent, profile and
@@ -23,9 +23,10 @@ info:
     - 400: `bad_request`, `invalid_reason_template`, `metric_not_applicable`
     - 401: `unauthorized`, `wrong_scope`, `bad_credentials`, `bad_mfa`, `mfa_pending`, `bad_signature`, `webhook_not_configured`
     - 403: `forbidden`, `forbidden_role`, `forbidden_scope`, `staff_only`, `session_required`, `same_person`, `mfa_enrolment_required`
-    - 404: `not_found`, `unknown_surface`, `unknown_request`, `unknown_flow_version`, `item_not_found`
-    - 409: `surface_off`, `experiment_running`, `signing_secret_exists`, `exists`, `approval_required`, `approval_pending`, `approval_decided`, `no_endpoints`, `deletion_scheduled`, `export_not_ready`, `last_owner`, `already_member`, `seat_limit`, `mfa_enforced`
-    - 422: `mode_conflict`, `no_candidates`, `unknown_item`, `displayed_position_required`, `pii_rejected` (catalog attributes), `bad_tester_id`, `bad_webhook_url`, `bad_slack_webhook`, `unknown_parent`, `parent_cycle`
+    - 404: `not_found` (also an unknown route), `unknown_surface`, `unknown_request`, `unknown_flow_version`, `item_not_found`
+    - 405: `method_not_allowed` (a known path with another method)
+    - 409: `not_shown`, `surface_off`, `experiment_running`, `signing_secret_exists`, `exists`, `approval_required`, `approval_pending`, `approval_decided`, `no_endpoints`, `deletion_scheduled`, `export_not_ready`, `last_owner`, `already_member`, `seat_limit`, `mfa_enforced`
+    - 422: `mode_conflict`, `mode_required`, `no_candidates`, `unknown_item`, `displayed_position_required`, `pii_rejected` (catalog attributes), `bad_tester_id`, `bad_webhook_url`, `bad_slack_webhook`, `unknown_parent`, `parent_cycle`
     - 429: `rate_limited`, `account_locked`, `too_many_attempts`
     - 500: `internal` (with the request id)
     Per-event codes in `POST /events` → `rejected[].code`: `invalid_event`, `pii_rejected`,
@@ -66,7 +67,15 @@ paths:
 
         Errors that are not fallbacks (fix the request): 400, 404 `unknown_surface`, 422
         `mode_conflict`. Errors where the caller shows its own list: 409 `surface_off`, 422
-        `no_candidates` (nothing left after the filters), 429, 5xx.
+        `no_candidates` (nothing left after the filters and the surface's fallback list is empty
+        too), 429, 5xx.
+
+        Arms: in `control` the slate is the editor's list for this page (see
+        `context.control_item_ids` and the surface's `fallback.by_anchor`), under the same rules
+        as treatment. A ranked slate shorter than `slots` is filled from that list behind the
+        ranked items (`fill_count`). A `personalized` or `cohort` request for a user who opted out
+        (`PUT /users/{id}/mode non_profiled`) is served as `non_profiled` and logged without the
+        user id. `shown: false` answers carry no items: hide the block, do not abandon it.
       parameters:
         - { name: X-Deadline-Ms, in: header, schema: { type: integer, minimum: 10, maximum: 10000 }, description: "the client's own deadline in milliseconds; the engine answers before it" }
         - { name: X-Request-Id, in: header, schema: { type: string, maxLength: 64 }, description: "a client-minted id (at most 64 characters) becomes the slate's request id, so the client can abandon a slate whose answer never arrived; without it the engine mints one" }
@@ -98,7 +107,8 @@ paths:
         Flags the impression `fallback: true, client_abandoned: true`. It counts in the fallback
         rate and stays in its arm in the ledger (intention to treat: dropping it would flatter the
         slower arm). Idempotent. Call it when the client's deadline passed, or when the app hid
-        the block for its own reasons.
+        the block for its own reasons. A slate answered `shown: false` is never abandoned (409
+        `not_shown`): it already counts in its arm with zero taps.
       parameters:
         - { name: request_id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -125,6 +135,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /interactions:
     post:
@@ -136,7 +147,9 @@ paths:
         `details.unknown_item_ids`). The item's kind and served position come from the logged
         slate; a client `kind` is ignored. On a surface with `device_resort` every interaction must
         carry `displayed_position` (422 `displayed_position_required`). Report only for users who
-        allowed usage analytics; the others are requested with `context.measured: false`.
+        allowed usage analytics; the others are requested with `context.measured: false`. A `seen`
+        with `block` records that the slate was seen in that block (`blocks_shown`), which feeds
+        the per-block ledger rows and surface metrics.
       requestBody:
         required: true
         content:
@@ -356,6 +369,26 @@ paths:
       responses:
         '200': { description: updated }
 
+  /users/summary:
+    get:
+      tags: [admin]
+      security: [{ apiKey: [] }, { panelSession: [] }]
+      summary: Consent-mode split, persona mix and active people for the Audiences screen
+      operationId: usersSummary
+      description: |
+        Counts only, never a user id. Non-profiled traffic has no user rows, so it is counted in
+        distinct sessions over the last 30 days; `daily_users` counts distinct randomised units
+        (user or session) served per day, oldest first.
+      parameters:
+        - { $ref: '#/components/parameters/IncludeSynthetic' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsersSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /users/{user_id}/mode:
     put:
       tags: [ingest]
@@ -363,8 +396,13 @@ paths:
       operationId: setUserMode
       description: |
         Ingest key (the customer's backend owns consent) or admin key. Switching to
-        `non_profiled` deletes the user row at once, keeps a salted opt-out marker and queues model
-        retraining.
+        `non_profiled` deletes the user row at once, keeps a salted opt-out marker and queues a
+        deletion request that stores only the salted hash (`sha256:…`), exactly like
+        `DELETE /users/{id}`: the jobs then unlink the user's impressions (kept for the ledger,
+        matched by the unit hash, never deleted) and delete events, assignments and shortlists,
+        and retraining follows. From that moment serve answers this user's profiled requests as
+        `non_profiled`, logged without the id. The call creates the user row for `personalized`
+        and `cohort`.
       parameters:
         - { name: user_id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -387,7 +425,8 @@ paths:
       description: |
         Ingest or admin key. Goals, activity, stress, wearable, premium flag. Never health values.
         422 `mode_conflict` for a `non_profiled` user (or one who opted out) unless the body sets
-        the mode explicitly.
+        the mode explicitly. A profile never creates consent: without `mode`, a user Patterna has
+        no row for is 422 `mode_required`; an existing user keeps their mode.
       parameters:
         - { name: user_id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -680,13 +719,19 @@ paths:
       operationId: ledger
       description: |
         Without `bucket`: one summary row per surface with the user-clustered interval. With
-        `bucket=week`: weekly rows per arm for the chart (Wilson intervals per impression, UTC weeks
-        from Monday; default the last 12 weeks).
+        `bucket=week`: weekly rows per arm for the chart, read with the summary row's rules (the
+        experiment's window, `unit_hash`, every served slate, a tap is a slate with a tap; Wilson
+        intervals per slate, UTC weeks from Monday; default the last 12 weeks). With `by=block`
+        (every block) or `block=<name>`: one row per surface and block, over the slates the client
+        reported seen in that block and taps in that block (`tap_rate`); descriptive, the
+        whole-slate row decides.
       parameters:
         - { name: surface, in: query, schema: { type: string } }
         - { name: from, in: query, schema: { type: string, format: date } }
         - { name: to, in: query, schema: { type: string, format: date } }
         - { name: bucket, in: query, schema: { type: string, enum: [week] } }
+        - { name: by, in: query, schema: { type: string, enum: [block] }, description: one row per surface and block }
+        - { name: block, in: query, schema: { type: string, maxLength: 32 }, description: one block only }
         - { $ref: '#/components/parameters/IncludeSynthetic' }
       responses:
         '200':
@@ -829,7 +874,7 @@ paths:
         - { name: actor, in: query, schema: { type: string, format: uuid } }
         - { name: from, in: query, schema: { type: string, format: date } }
         - { name: to, in: query, schema: { type: string, format: date } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - { name: cursor, in: query, description: "the id of the last entry already read; the next page holds older entries", schema: { type: string } }
       responses:
         '200':
           description: entries
@@ -866,6 +911,7 @@ paths:
       parameters:
         - { name: key, in: path, required: true, schema: { type: string } }
         - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 180, default: 28 } }
+        - { name: block, in: query, schema: { type: string, maxLength: 32 }, description: "only slates seen in this block, and taps in it" }
         - { $ref: '#/components/parameters/IncludeSynthetic' }
       responses:
         '200':
@@ -2528,7 +2574,8 @@ paths:
                   status: { type: string }
                   postgres: { type: string }
                   redis: { type: string }
-                  version: { type: string }
+                  version: { type: string, description: the release (commit) }
+                  engine_version: { type: string, example: 0.2.0, description: "the API version this engine serves (info.version); GET /healthz outside /v1 reports {status, release, engine_version} too" }
 
   # ---- panel backends (docs/PANEL_API.md, "Panel backends") -----------------------------------
   /connectors/sources:
@@ -3058,6 +3105,8 @@ components:
             premium: { type: boolean }
             candidate_kinds: { type: array, items: { type: string } }
             measured: { type: boolean, default: true, description: "false when the user did not allow usage analytics. The slate is served and logged with exact propensities, but it stays out of the ledger, the power calculation and all learning in both arms; the app reports no interactions for it. Consent is decided before the list is drawn, so leaving these slates out of both arms keeps the comparison unbiased." }
+            control_item_ids: { type: array, maxItems: 50, items: { type: string }, description: "the customer's own editorial list for this page (an article's pairs-with products, the editor's related articles). In the control arm it is the slate, in this order, under the request's rules (never the anchor, excluded ids, joined communities, other kinds; the premium policy), logged with control_source request; newest items fill the rest. In treatment it is the list short slates are filled from." }
+            member_of: { type: array, maxItems: 500, items: { type: string }, description: "community ids the user is in, for requests without an identity (non_profiled): never offered. In personalized and cohort mode membership also comes from community_joined/community_left events." }
         slots: { type: integer, minimum: 1, maximum: 50 }
         exclude_item_ids: { type: array, items: { type: string }, maxItems: 200 }
         shadow: { type: boolean, description: log and return but mark as not shown }
@@ -3077,8 +3126,10 @@ components:
           type: array
           items: { $ref: '#/components/schemas/SlateItem' }
         fallback: { type: boolean, description: "true when the non-personalized list was returned as the safety net (timeout, storage trouble, no active flow)" }
-        shown: { type: boolean, description: "false when the slate has fewer items than the surface's min_slots: hide the block. Such a slate is logged as not shown and stays out of the ledger and the metrics." }
+        shown: { type: boolean, description: "false when fewer items than the surface's min_slots pass the request's rules (counted before the arm, so both arms hide alike). The answer then carries no items: hide the block and do not abandon the slate (409 not_shown). It stays in its arm in the ledger as a served slate with zero taps (intention to treat)." }
         latency_ms: { type: integer }
+        control_source: { type: string, enum: [request, by_anchor, surface], description: "editorial slates only: the request's control_item_ids, the surface's fallback.by_anchor list for the anchor, or the surface's own list" }
+        fill_count: { type: integer, minimum: 0, description: "trailing positions filled from the editorial list because the ranked candidates ran out (generator fallback, propensity 1); absent when 0" }
 
     SlateItem:
       type: object
@@ -3106,7 +3157,7 @@ components:
           example: { nl: "Omdat je Magnesium en slaap las", en: "Because you read Magnesium en slaap" }
         generator: { type: string }
         score: { type: number }
-        phase_fit: { type: array, items: { type: string }, description: phase tags for on-device re-sorting; never used server-side }
+        phase_fit: { type: array, items: { type: string }, description: "phase tags from the item's catalog attributes, for on-device re-sorting; never used server-side. Sent only when the tenant turned phase_tags on (Settings; off by default)." }
 
     Interaction:
       type: object
@@ -3116,7 +3167,7 @@ components:
         kind: { type: string, description: "ignored: the kind comes from the logged slate" }
         position: { type: integer, minimum: 0, description: "the slot Patterna served (0-based); the engine records the served slot from its log" }
         displayed_position: { type: integer, minimum: 0, description: "where the app showed it (0-based), when it re-sorted on the device; required on a device_resort surface" }
-        block: { type: string, maxLength: 32, description: "which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace" }
+        block: { type: string, maxLength: 32, description: "which block of the page showed it, when one slate is rendered in two places (e.g. top and end); stored and shown in the trace. A seen with a block records the block on the impression (per-block ledger rows)." }
         type: { type: string, enum: [seen, click, dismiss] }
         occurred_at: { type: string, format: date-time }
 
@@ -3250,13 +3301,19 @@ components:
         name: { type: string }
         item_kinds: { type: array, items: { type: string } }
         slots: { type: integer }
-        fallback: { type: object, description: "{ kind: newest | curated, item_ids: [] }" }
+        fallback:
+          type: object
+          description: "The surface's editorial list: the control arm, the rollout gate, the safety net and the fill for short slates. kind newest, popular (7-day) or curated (item_ids, in order); by_anchor maps an anchor's external id to the editor's list for that page (used when the request's anchor_item_id is a key). The request's own context.control_item_ids wins over both."
+          properties:
+            kind: { type: string, enum: [newest, popular, curated] }
+            item_ids: { type: array, items: { type: string } }
+            by_anchor: { type: object, additionalProperties: { type: array, items: { type: string } } }
         exploration_share: { type: number, minimum: 0, maximum: 1 }
         status: { type: string, enum: [shadow, testers, live, off] }
         testers: { type: array, items: { type: string }, maxItems: 200, description: "user ids from the app (never emails)" }
         notes: { type: string, maxLength: 4000, description: placement notes }
         device_resort: { type: boolean, description: "the app re-sorts the slate on the device. Allowed under a holdout (both arms are re-sorted by the same rule, the ledger stays intention to treat on served slates); every interaction must then carry displayed_position. PATCH only." }
-        min_slots: { type: integer, minimum: 0, maximum: 50, description: "a slate shorter than this after the filters is returned with shown=false and logged as not shown (outside the ledger and metrics). 0 = always shown. PATCH only." }
+        min_slots: { type: integer, minimum: 0, maximum: 50, description: "below this many items passing the request's rules (exclusions, anchor, joined communities, candidate kinds, premium, freshness; counted before the arm) the answer is shown=false with no items, logged not_shown, and counted in its arm with zero taps. 0 = always shown. PATCH only." }
 
     Surface:
       allOf:
@@ -3372,9 +3429,10 @@ components:
             join_rate (surfaces that serve communities, else 400 metric_not_applicable): a
             community_joined for a community in the slate within 7 days, by the slate's user,
             session or request. engaged_after_tap: item_engaged or item_completed for a tapped item
-            within 7 days of the tap, same identity match. Unmeasured and not-shown slates are
-            outside every metric.
-        stratify_by: { type: string, default: persona }
+            within 7 days of the tap, same identity match. Unmeasured slates are outside every
+            metric; a not-shown slate counts as served with no success.
+        stratify_by: { type: string, enum: [none, persona], default: none, description: "persona: each persona stratum (none for requests without a persona) is hashed on its own against its share" }
+        strata_shares: { type: object, additionalProperties: { type: number, exclusiveMinimum: 0, maximum: 1 }, description: "treatment share per persona stratum (stratify_by persona only); a stratum not listed uses treatment_share. The SRM check expects the assignment-weighted share." }
         baseline_rate: { type: number }
         relative_change: { type: number, description: "the change to detect, e.g. 0.2" }
 
@@ -3409,7 +3467,9 @@ components:
         n_users_treatment: { type: integer }
         srm_p: { type: number, description: sample-ratio-mismatch p-value; below 0.001 the row must not be read }
         note: { type: string }
-        readable: { type: boolean, description: false below the readable sample; interval shown dashed }
+        readable: { type: boolean, description: "each arm has at least readable_sample units and the interval exists; interval shown dashed otherwise" }
+        readable_sample: { type: integer, description: "units per arm from the power calculation (alpha 0.05, power 0.8) on the experiment's planned baseline and relative change; without a baseline the observed control rate, without a change 20%; 0 while the control rate is 0" }
+        block: { type: string, description: per-block rows only (by=block or block=) }
         revenue_cents_control: { type: [integer, 'null'] }
         revenue_cents_treatment: { type: [integer, 'null'] }
         export_uri: { type: [string, 'null'] }
@@ -3454,7 +3514,8 @@ components:
       type: object
       properties:
         id: { type: integer }
-        actor: { type: [string, 'null'] }
+        actor: { type: [string, 'null'], description: panel user id; null for the system and API keys }
+        actor_email: { type: [string, 'null'], description: "the panel user's sign-in email, for display" }
         action: { type: string }
         target: { type: string }
         diff: { type: [object, 'null'] }
@@ -3503,6 +3564,7 @@ components:
             properties:
               at: { type: string, format: date-time }
               actor: { type: [string, 'null'] }
+              actor_email: { type: [string, 'null'] }
               action: { type: string }
               target: { type: string }
         analyst_note:
@@ -3526,6 +3588,8 @@ components:
               unmeasured_share: { type: [number, 'null'], description: "slates requested with context.measured=false (outside the ledger and learning)" }
               p99_ms: { type: [number, 'null'] }
               explored_share: { type: [number, 'null'] }
+              not_shown_share: { type: [number, 'null'], description: "slates answered shown:false over all slates (they are in the ledger with zero taps, not in the other rates)" }
+              block: { type: string, description: echoed when the block filter is set }
 
     PreviewRequest:
       type: object
@@ -3537,6 +3601,20 @@ components:
         flow_version: { type: integer, description: preview a draft version }
         slots: { type: integer }
 
+    UsersSummary:
+      type: object
+      properties:
+        window_days: { type: integer }
+        active_users: { type: integer, description: profiled users seen in the window }
+        modes:
+          type: object
+          properties:
+            personalized: { type: integer }
+            cohort: { type: integer }
+            non_profiled_sessions_30d: { type: integer }
+        personas: { type: object, description: persona → users, additionalProperties: { type: integer } }
+        daily_users: { type: array, items: { type: integer } }
+
     Preview:
       type: object
       properties:
@@ -3545,6 +3623,10 @@ components:
           type: object
           description: item id → generator → contribution
           additionalProperties: { type: object, additionalProperties: { type: number } }
+        propensities:
+          type: object
+          description: item id → the logged probability that the policy put this item in its slot
+          additionalProperties: { type: number }
 
     CuratedItem:
       type: object
@@ -3609,12 +3691,12 @@ components:
         week_start: { type: string, format: date }
         surface: { type: string }
         arm: { type: string, enum: [control, treatment] }
-        impressions: { type: integer, description: impressions reported as seen }
-        taps: { type: integer }
+        impressions: { type: integer, description: "slates served in the experiment's window (shown or not, seen or not: intention to treat)" }
+        taps: { type: integer, description: slates with at least one tap }
         rate: { type: number }
         lo: { type: number }
         hi: { type: number }
-        users: { type: integer, description: randomised units with a seen impression that week }
+        users: { type: integer, description: randomised units (unit_hash) served that week }
 
     Power:
       type: object
@@ -3708,6 +3790,7 @@ components:
         exploration_default: { type: number }
         premium_policy_default: { type: string, enum: [allow, cap, exclude] }
         two_person_rule: { type: boolean }
+        phase_tags: { type: boolean, description: "serve phase_fit item metadata in slates (off by default)" }
         suspended_at: { type: [string, 'null'], format: date-time }
         paused: { type: boolean }
         deletion_scheduled_for: { type: [string, 'null'], format: date-time, description: set by POST /settings/delete-workspace }
@@ -3749,6 +3832,7 @@ components:
         exploration_default: { type: number, minimum: 0, maximum: 0.5 }
         premium_policy_default: { type: string, enum: [allow, cap, exclude] }
         two_person_rule: { type: boolean }
+        phase_tags: { type: boolean, description: "turn phase_fit item metadata on in slates and the importer" }
         webhooks: { type: array, maxItems: 10, items: { $ref: '#/components/schemas/WebhookEndpoint' } }
         posthog_token: { type: string, description: "24 to 200 random characters the PostHog destination sends in X-Patterna-Token; stored as its SHA-256; empty removes it" }
         shopify_webhook_secret: { type: string, maxLength: 200, description: "the Shopify app's webhook signing secret; never returned; empty removes it (and the Shopify webhook then refuses every call)" }
@@ -3813,6 +3897,8 @@ components:
             id: { type: string }
             requested_by: { type: [string, 'null'] }
             approved_by: { type: [string, 'null'], description: the deciding user (also on rejection) }
+            requested_by_email: { type: [string, 'null'], description: "the requester's sign-in email, for display" }
+            approved_by_email: { type: [string, 'null'], description: "the decider's sign-in email, for display" }
             state: { type: string, enum: [pending, approved, rejected] }
             decision_note: { type: string }
             created_at: { type: string, format: date-time }

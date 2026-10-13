@@ -49,9 +49,15 @@ coordinates, or any health value (`pii`).
 | `push_sent`, `push_opened` | `notification_type`, `item_id` | | backend |
 | `tip_shown`, `tip_tapped` | `tip_id` | | app |
 | `coach_question` | `topic_cluster` | intent | backend (never the text) |
-| `coach_product_shown` | `product_id`, `conversation_id` | | backend; the products an LLM answer named, no slate (no position, no propensity), learning signal only |
-| `consent_changed` | `mode` (`personalized`, `cohort`, `non_profiled`) | control | backend |
-| `user_deleted` | | control | backend; triggers the deletion job |
+| `coach_product_shown` | `product_id`, `conversation_id`, `position` | | backend; a product an LLM answer named, shown under the answer. `product_id` is the product's catalog `external_id`; `position` is its 0-based place among the answer's products. No slate and no propensity: a learning signal and a descriptive count, never in the ledger |
+| `coach_product_tapped` | `product_id`, `conversation_id`, `position` | positive | backend; the user tapped such a product |
+| `consent_changed` | `mode` (`personalized`, `cohort`, `non_profiled`) | control | backend; `non_profiled` is the same opt-out as `PUT /users/{id}/mode`: the user row goes, a salted marker stays, the deletion request stores only the salted hash and the jobs unlink the user's impressions (kept for the ledger) |
+| `user_deleted` | | control | backend; triggers the deletion job (hashed request, impressions unlinked, never deleted) |
+
+Identity on the coach events, as on every event: `user_id` only in `personalized` and `cohort`
+mode; a `non_profiled` user's event carries the rotating `session_id` only (the one the app sends
+with its recommendation requests), so it never joins a profile. `conversation_id` is the
+customer's own opaque id for the conversation (never message text).
 
 `rec_*` events with a `request_id` follow the rules of `POST /v1/interactions`: the item must be
 in the slate served for that request (`unknown_item`), the kind and the served position are taken
@@ -113,16 +119,24 @@ slot.
 One slate may be rendered in two blocks of a page (for example the product near the top of an
 article and the products at its end): request one slate, render position 0 at the top and 1 to n
 at the end, and send `block` (a short name such as `top` or `end`) with each interaction. Dedup and
-propensities stay in one impression.
+propensities stay in one impression. A `seen` with `block` records the block on the impression
+(`blocks_shown`); `GET /proof/ledger?by=block` and `GET /surfaces/{key}/metrics?block=` then split
+the numbers per block (slates seen in the block, taps in the block).
 
 ## Measured and not shown
 
 A slate requested with `context.measured: false` (the user did not allow usage analytics) is
 served and logged with exact propensities but reports no interactions and stays out of the ledger,
 the power calculation and all learning, in both arms. Consent is decided before the list is
-drawn, so excluding these slates from both arms keeps the comparison unbiased. A slate shorter
-than the surface's `min_slots` is returned with `shown: false`, logged `not_shown`, and treated
-the same way.
+drawn, so excluding these slates from both arms keeps the comparison unbiased.
+
+Not shown is different: whether a block is shown could depend on the arm, so those slates are
+never dropped. The engine decides `shown` before the arm, from the number of items that pass the
+request's rules, against the surface's `min_slots`. Below it the answer is `shown: false` with no
+items in either arm, logged `not_shown`; the slate stays in its arm in the ledger as served with
+zero taps (intention to treat). The app hides the block and reports nothing; it must not abandon
+the slate (409 `not_shown`). A block the app hides for its own reasons after a shown answer is
+abandoned (below) and also stays in its arm, so engine-hidden and app-hidden blocks count alike.
 
 ## Abandoned slates
 
@@ -136,7 +150,11 @@ A client that gave up on a slate (its deadline passed, or it hid the block) call
 `item_engaged` 0.6 when `engaged_seconds >= 20` else 0 · `item_viewed` 0.2 · `item_pinned` 2.0 ·
 `rec_dismiss` -1.0 · `community_left` -1.0 · `order_placed` 2.0 per product.
 
-## PostHog mapping (Elvou, shipped 2026-10-11)
+## PostHog mapping
+
+Status: built (the webhook `POST /v1/webhooks/posthog`, since engine 0.2) and off until a tenant's
+owner sets a PostHog token (`PATCH /settings`, `posthog_token`; only its SHA-256 hash is stored).
+Without a token the webhook accepts nothing. For Elvou it stays off. When on, the mapping is:
 
 | PostHog event | Canonical | Dropped |
 |---|---|---|

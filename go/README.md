@@ -1,8 +1,10 @@
 # sdk-go: `github.com/payam-h/patterna-sdk/go`
 
-Version 0.2.0 (see `CHANGELOG.md`). Features marked **engine 0.2** need the engine release that
-adds the matching endpoint, header or field; against an older engine they are ignored or answer
-404, and nothing else breaks.
+Version 0.2.0 (see `CHANGELOG.md`). Needs engine 0.2 or later, which is the engine in production.
+
+```sh
+go get github.com/payam-h/patterna-sdk/go@v0.2.0   # tag go/v0.2.0 in payam-h/patterna-sdk
+```
 
 Go client for the Patterna API, built for a customer backend in a request path (Elvou's Gin +
 gqlgen backend is the first user; see `docs/elvou-integration.md`).
@@ -30,9 +32,9 @@ go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
 | `breaker.go` | consecutive-failure circuit breaker, one per scope |
 | `fallback.go` | `RecommendWithFallback` and `Recommendation` |
 | `consent.go` | consent gate and the opaque-user-id check |
-| `signing.go` | canonical JSON and HMAC-SHA256 event signatures (same bytes as `@patterna/sdk`) |
+| `signing.go` | canonical JSON and HMAC-SHA256 event signatures (same bytes as `patterna-sdk`) |
 | `errors.go` | `*Error`, codes, sentinels for `errors.Is` |
-| `types.go` | hand-written mirror of `contracts/openapi.yaml` (plus the engine 0.2 fields) |
+| `types.go` | hand-written mirror of `contracts/openapi.yaml` |
 | `admin/` | flows, surfaces, experiments, ledger, signing secret (admin key) |
 | `cmd/patterna/` | the CLI on top of `admin` |
 | `internal/fakeengine/` | in-memory admin endpoints for the admin and CLI tests |
@@ -74,30 +76,30 @@ if rec.Slate != nil {
 | `IngestEvents`, `UpsertItems`, `SetItemStatus`, `SetItemTags` | ingest | 5 s | once |
 | `SetUserMode`, `SetUserProfile`, `DeleteUser` | admin if set, else ingest | 5 s | once |
 | `RecommendMany` | serve | 150 ms for all | never |
-| `Abandon` (async), `AbandonSync` (engine 0.2) | serve (ingest breaker) | 5 s | once |
-| `DeleteItem`, `ListItems`, `ItemsChangedSince` (engine 0.2) | ingest | 5 s per page | once |
-| `CreateSigningSecret` (engine 0.2), `AdminCall`, `admin.*` | admin | 30 s | idempotent ones once |
+| `Abandon` (async), `AbandonSync` | serve (ingest breaker) | 5 s | once |
+| `DeleteItem`, `ListItems`, `ItemsChangedSince` | ingest | 5 s per page | once |
+| `CreateSigningSecret`, `AdminCall`, `admin.*` | admin | 30 s | idempotent ones once |
 
 - **Deadlines.** Each call runs under `context.WithTimeout(ctx, budget)`; a shorter caller
   deadline wins. The budget covers the retry too. A deadline is `ErrTimeout`; a caller cancel is
   `ErrAborted`.
-- **Server deadline (engine 0.2).** Recommend sends `X-Deadline-Ms`, 120 ms by default
-  (`Config.RecommendDeadline`, always below `RecommendTimeout`), so the engine serves its own
-  fallback in time instead of answering after the client gave up. With a shorter caller deadline
+- **Server deadline.** Recommend sends `X-Deadline-Ms`, 120 ms by default
+  (`Config.RecommendDeadline`, always below `RecommendTimeout`; the engine's own default budget
+  is 120 ms too), so the engine serves its own fallback in time instead of answering after the client gave up. With a shorter caller deadline
   the header shrinks by the same 30 ms margin: 80 ms left sends 50.
 - **Request and trace ids.** The client mints `X-Request-Id` for every call (UUIDv4;
   `WithRequestID` overrides). The engine uses it as the slate's `request_id`, and every `*Error`
   carries it, even on a timeout. `X-Trace-Id` comes from `WithTraceID(id)`, else
   `ContextWithTraceID(ctx, id)`, else `Config.TraceID(ctx)` (for Sentry or OpenTelemetry). Ids
   longer than 64 characters or with spaces are not sent.
-- **Abandoned slates (engine 0.2).** When `RecommendWithFallback` falls back after the request
+- **Abandoned slates.** When `RecommendWithFallback` falls back after the request
   reached the engine (timeout, network error, 5xx, unreadable answer) it queues
   `POST /recommendations/{id}/abandon` with the reason, so the impression is flagged
   `client_fallback` and the fallback rate and the ledger stay honest. Nothing is sent when the
   breaker was open (the request never left) or the engine refused the request with a 4xx (nothing
   was logged). Call `pc.Abandon(id, patterna.AbandonClientFallback)` yourself when a slate
   arrived but the app showed something else.
-- **Testers (engine 0.2).** `pc.Recommend(ctx, req, patterna.WithTester())` sends
+- **Testers.** `pc.Recommend(ctx, req, patterna.WithTester())` sends
   `X-Patterna-Tester: 1`; your backend decides who is a tester, so staff need no random ids on a
   roster.
 - **Retry.** One retry after 100 ms on 5xx and network errors, idempotent calls only.
@@ -150,13 +152,13 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 
 ## Interactions: kind, re-sorting and split blocks
 
-- **`Kind`** is required for anything that is not a document (engine 0.2 refuses it otherwise).
+- **`Kind`** is required for anything that is not a document.
   When this client served the slate it knows the kinds, and an empty `Kind` on a community,
   product, event or tip is an `ErrInvalidArgument` before anything is sent.
   `slate.Interaction(itemID, type, at)` fills `Kind` and `Position` from the slate.
-- **`DisplayedPosition`**: when the app re-sorts on the device (Elvou's cycle-phase sort), keep
+- **`DisplayedPosition`**: when the app re-sorts on the device (a surface with `device_resort`), keep
   `Position` as the served slot and set `DisplayedPosition` to where it was shown.
-- **`Block` (engine 0.2)**: when one slate is split across UI blocks, name the block. Example: a
+- **`Block`**: when one slate is split across UI blocks, name the block. Example: a
   slate of 7 shown as one top slot and an end carousel of six. Ask for one slate, render
   `Items[0]` in the top slot and `Items[1:7]` in the carousel, and report with the served
   position and the block:
@@ -182,10 +184,10 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 
 ## Consent: measured and assignment unit
 
-- **`Measured` (engine 0.2).** `req.Context.SetMeasured(analyticsConsent)`: with `false` the
+- **`Measured`.** `req.Context.SetMeasured(analyticsConsent)`: with `false` the
   slate is ranked and shown but left out of the ledger and the training data. Unset means
   measured. At Elvou, pass the user's `analytics` consent.
-- **`AssignmentUnit` (engine 0.2).** For `non_profiled` traffic under a holdout, the rotating
+- **`AssignmentUnit`.** For `non_profiled` traffic under a holdout, the rotating
   session id would put one person in both arms. Send
   `req.AssignmentUnit = patterna.AssignmentUnit(experimentSecret, yourUserID)`: hex
   HMAC-SHA256 under a secret you hold per experiment and never send. The engine uses it only for
@@ -196,8 +198,8 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 
 ```go
 err := pc.ItemsChangedSince(ctx, lastRun, "", func(it patterna.Item) error { return reconcile(it) })
-err = pc.DeleteItem(ctx, patterna.KindCommunity, "community_42") // engine 0.2; archive with SetItemStatus instead if it may return
-secret, err := pc.CreateSigningSecret(ctx)                       // engine 0.2, admin key, shown once
+err = pc.DeleteItem(ctx, patterna.KindCommunity, "community_42") // archive with SetItemStatus instead if it may return
+secret, err := pc.CreateSigningSecret(ctx)                       // admin key, shown once
 signed, err := patterna.SignEvent(ev, secret.SigningSecret)        // the string as returned, never hex-decoded
 ```
 
@@ -238,25 +240,17 @@ it. On a tenant with the two-person rule, activation answers 409 `approval_requi
 
 ## Releases and tags
 
-The module lives in a subdirectory, so Go expects tags prefixed with its path:
-`packages/sdk-go/vX.Y.Z`. After merging to `main`:
+Customers install the SDK from the public mirror, not from this repository. `scripts/sdk-release.sh
+<version> --push` (or the `sdk-release` workflow on an `sdk/v<version>` tag) copies this directory to
+[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) under `go/`, rewrites the module
+path to `github.com/payam-h/patterna-sdk/go`, and tags `v<version>` and `go/v<version>`. A consumer
+then needs nothing but:
 
 ```sh
-git tag -a packages/sdk-go/v0.2.0 -m "sdk-go 0.2.0" <merge-commit>
-git push origin packages/sdk-go/v0.2.0
-```
-
-Then, in a consumer (the repository is private, so tell Go not to use the public proxy and give
-git a deploy key or token):
-
-```sh
-go env -w GOPRIVATE=github.com/payam-h/*
-git config --global url."git@github.com:".insteadOf "https://github.com/"   # SSH deploy key
 go get github.com/payam-h/patterna-sdk/go@v0.2.0
 ```
 
-`go get` takes the plain version (`@v0.2.0`); the prefix is only on the tag. Bump the version in
-`CHANGELOG.md` with each tag. A v2 would need `/v2` at the end of the module path.
+Bump `CHANGELOG.md` with each release. A v2 would need `/v2` at the end of the public module path.
 
 ## Status
 
@@ -266,6 +260,12 @@ reporting with drain on Close, `RecommendWithFallback` and `RecommendMany`, cons
 checks, assignment units, event signing with the cross-language vector, typed errors, the admin
 package and the CLI. Table-driven tests with `httptest` (race detector on), `go vet` and
 `staticcheck` clean.
+
+Not yet in the SDK: the request fields `context.control_item_ids` (the caller's own editorial
+list, the control slate for this page) and `context.member_of` (communities to exclude) are not on
+`RecommendContext`, and `control_source` and `fill_count` are not on `Slate` (engine 0.3, API
+0.2.0). They need an SDK update. A `shown: false` answer is a normal 200 and is never abandoned:
+the SDK abandons only after a timeout, a network error or a 5xx.
 
 Deliberately left out:
 

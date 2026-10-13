@@ -2,8 +2,45 @@
 
 Module `github.com/payam-h/patterna-sdk/go`. Tags are `go/vX.Y.Z` in
 [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk); install with
-`go get github.com/payam-h/patterna-sdk/go@v0.3.0`.
-SDK 0.2 and 0.3 need engine 0.2 or later; the 0.3 fields take effect with engine 0.3 (API 0.2.0).
+`go get github.com/payam-h/patterna-sdk/go@v0.4.0`.
+SDK 0.2 to 0.4 need engine 0.2 or later; the 0.3 fields take effect with engine 0.3 (API 0.2.0),
+the 0.4 fields with engine round 5 (API 0.3.0; older engines ignore them).
+
+## 0.4.0 (2026-10-13)
+
+Source-compatible with 0.3: every change adds a field, a type, a function or a check. The
+shared signing and assignment-unit vectors are unchanged.
+
+### Added
+
+- **Request context.** `RecommendContext.Weekday` (0 = Monday), `SubscriptionTier`
+  (`TierFree`, `TierPremium` or a tenant name), `TenureDays`, and the 0.3.0 contract's `Region`
+  and `SessionItems`, which 0.3 did not have. `LocalTime(t, loc)` and `SetLocalTime` on
+  `RecommendContext` and `EventContext` derive the hour and weekday in the user's timezone.
+  `Ptr` makes the optional fields one-liners.
+- **Event context.** `EventContext.Weekday`, `Region`, `SubscriptionTier`, `TenureDays`.
+- **Editorial attributes.** `ItemAttributes` (format, duration and reading time, difficulty,
+  author, availability, expiry, event start, repurchase window, region, phase fit, and the
+  panel's price, compare-at price, currency, image, URL, product type, categories) on
+  `ItemUpsert.Editorial`, written into `attributes`; its region goes to the new top-level
+  `ItemUpsert.Region`. `ItemFormat` and `Difficulty` constants.
+- **Activity events.** `CommunityPostCreated`, `CommunityReply`, `CommunityReaction`,
+  `PaywallViewed`, `PushOpened`, `SearchPerformed`, `ItemEngaged`, `ItemCompleted` and
+  `OrderPlaced` on a shared `EventBase`, with the consent rule (user id in personalized and
+  cohort, session id only in non_profiled) and the `Event*` type constants.
+- **Reasons.** `ReasonRecommended` and the other reason keys as constants; `ReasonKeys`.
+- **Flows.** `admin.FlowConfig`, `GeneratorSpec`, `FlowFilters` (with `ExcludeDismissedDays`,
+  `ExcludeConsumedDays`, `PaywallCooldownDays`, `RepurchaseDays`, `HideUnavailable`,
+  `RelevanceFloor`), `RankerSpec`, `ExplorationSpec`; generator constants with `GenTimeFit` and
+  `GenFormatFit`; `admin.ValidateFlowConfig`.
+
+### Changed
+
+- `Recommend` (and everything built on it), `IngestEvents` and `UpsertItems` refuse
+  out-of-range context and attribute values before sending (`invalid_argument`).
+- `CreateFlow`, `PlanFlow`, `ApplyFlow` and `patterna flow apply` validate the config first; the
+  CLI checks every file before applying the first. A config that the engine accepted but that
+  names an unknown filter key now fails here.
 
 ## 0.3.0 (2026-10-13)
 

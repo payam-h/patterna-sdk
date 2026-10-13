@@ -25,10 +25,18 @@ export interface paths {
          *     non-personalized list with `fallback: true`. A client that gave up anyway reports it with
          *     `POST /recommendations/{request_id}/abandon`, so the fallback rate and the ledger see it.
          *
-         *     Errors that are not fallbacks (fix the request): 400, 404 `unknown_surface`, 422
-         *     `mode_conflict`. Errors where the caller shows its own list: 409 `surface_off`, 422
-         *     `no_candidates` (nothing left after the filters and the surface's fallback list is empty
-         *     too), 429, 5xx.
+         *     Errors that are not fallbacks (fix the request): 400 (`unknown_region`: context.region is
+         *     not one of the tenant's regions), 404 `unknown_surface`, 422 `mode_conflict`. Errors
+         *     where the caller shows its own list: 409 `surface_off`, 422 `no_candidates` (nothing left
+         *     after the filters and the surface's fallback list is empty too), 429 (`rate_limited`, or
+         *     `quota_exceeded`: the plan's monthly serve requests are used; details carry `quota`,
+         *     `used` and `resets_at`, the 1st of next month UTC), 5xx.
+         *
+         *     Quota: a tenant whose plan has a monthly request quota (`request_quota_monthly`) gets 429
+         *     `quota_exceeded` once this month's serve requests (every `POST /recommendations` sent with
+         *     a key, counted from key usage) reach it, and one `quota_warning` notification at 90%. The
+         *     count follows the key usage flush, so across several engine instances it can lag by about
+         *     ten seconds.
          *
          *     Arms: in `control` the slate is the editor's list for this page (see
          *     `context.control_item_ids` and the surface's `fallback.by_anchor`), under the same rules
@@ -2408,6 +2416,12 @@ export interface components {
                 /** @enum {string} */
                 platform?: "ios" | "android" | "web";
                 hour_bucket?: number;
+                /** @description 0 = Monday, from the device clock; derived from the request time in the tenant's timezone when absent. With hour_bucket it selects one of eight time buckets for the time_fit generator (docs/SIGNALS.md). */
+                weekday?: number;
+                /** @description free, premium or a tenant-defined tier. For free the premium policy applies and an item that showed this user a paywall in the last 7 days is left out. A ranker feature; never stored on the user. */
+                subscription_tier?: string;
+                /** @description days since the account was created, bucketed by the engine to new (<7), settled (<90) and long. A ranker feature only. */
+                tenure_days?: number;
                 /** @description the item the user is on (an article, a community). Resolved against the whole catalog, any kind: an article can anchor a product list (reason pairs_with). */
                 anchor_item_id?: string;
                 premium?: boolean;
@@ -2421,6 +2435,10 @@ export interface components {
                 control_item_ids?: string[];
                 /** @description community ids the user is in, for requests without an identity (non_profiled): never offered. In personalized and cohort mode membership also comes from community_joined/community_left events. */
                 member_of?: string[];
+                /** @description coarse per-request context: one of the regions the tenant configured (Settings regions; anything else is 400 unknown_region). Items of the same region score up by the flow's filters.region_boost; other items are never hidden. Stored only with the impression, never on the user. A region, never a location: no coordinates, no address, no postcode. */
+                region?: string;
+                /** @description item ids this session just looked at, most recent first, for the session_items generator. Merged ahead of what the session reported through /interactions (seen and tapped slate items) and its engaged views (item_engaged events with the session id) in the last day. Session context only: works in every mode and never touches a user row. */
+                session_items?: string[];
             };
             slots?: number;
             exclude_item_ids?: string[];
@@ -2460,10 +2478,19 @@ export interface components {
             position: number;
             /**
              * @description Which signal won the slot; one of similar_to_read, similar, pairs_with, matches_goals,
-             *     more_about_tag, people_like_you, trending, editors_pick, new, popular (a string, so a
+             *     more_about_tag, people_like_you, trending, editors_pick, new, popular, recommended (a string, so a
              *     new key is not a breaking change). similar_to_read: item_to_item with an anchor of the same
-             *     kind; pairs_with: an anchor of another kind (article → product); similar: item_to_item
-             *     without an anchor; matches_goals: content_affinity won on a goal the user declared;
+             *     A reason is only said when it is true: the winning signal must be positive for the item
+             *     (a raw similarity, affinity or logit above zero), "trending" needs this surface's own
+             *     log (the tenant-wide cold-start prior says "popular"), "people like you" needs a real
+             *     persona and "new" an item under 30 days old; otherwise the slot says "recommended" and
+             *     nothing more. time_fit, format_fit and region_match never name a reason.
+             *     kind; pairs_with: an anchor of another kind that pairs with the slot: a recipe (a document
+             *     in a recipe-like collection) or a workout (a document in a workout-like collection) with a
+             *     product ("Past bij dit recept" / "Past bij deze workout"), or a community with a document
+             *     ("Gelezen in deze community"); any other cross-kind anchor says more_about_tag; similar:
+             *     item_to_item without an anchor, or session_items (what this session just looked at);
+             *     matches_goals: content_affinity won on a goal the user declared;
              *     more_about_tag: content_affinity won on behaviour; people_like_you: persona_bayes or
              *     user_bayes; trending; editors_pick: curated; new: freshness or the newest list;
              *     popular: the popular list.
@@ -2520,6 +2547,11 @@ export interface components {
                 app_version?: string;
                 platform?: string;
                 hour_bucket?: number;
+                weekday?: number;
+                /** @description a tenant-configured coarse region name, never coordinates */
+                region?: string;
+                subscription_tier?: string;
+                tenure_days?: number;
             };
             props?: Record<string, unknown>;
         };
@@ -2543,10 +2575,12 @@ export interface components {
             premium?: boolean;
             /** Format: date-time */
             published_at?: string;
-            /** @description price_cents, currency, difficulty, duration_min, categories[], phase_fit[], image_url, url */
+            /** @description editorial attributes. The engine reads (docs/SIGNALS.md): format (text|video|audio|recipe|workout|tool|product), duration_min or reading_time_min, difficulty (easy|medium|hard), author, available or in_stock (products; false is never served), expires_at (RFC 3339; never served after), starts_at (events; never served after), repurchase_days (products), region (one of the tenant's regions), phase_fit[]. Kept for the panel: price_cents, compare_at_cents, currency, categories[], image_url, url, product_type. */
             attributes?: Record<string, unknown>;
             /** @description body text for enrichment; stored only as embedding and tags, never returned */
             text?: string;
+            /** @description the coarse region the item belongs to; must be one of the tenant's regions (Settings), else 400 unknown_region. Requests from that region rank the item up by the flow's region_boost. */
+            region?: string;
             tags?: {
                 tag?: string;
                 weight?: number;
@@ -2566,6 +2600,7 @@ export interface components {
             /** Format: date-time */
             updated_at?: string;
             attributes?: Record<string, unknown>;
+            region?: string | null;
             tags?: {
                 tag?: string;
                 weight?: number;
@@ -2613,6 +2648,15 @@ export interface components {
             arm?: string;
             policy_version?: string;
             explored?: boolean;
+            fallback?: boolean;
+            /** @enum {string|null} */
+            control_source?: "request" | "by_anchor" | "surface" | null;
+            fill_count?: number;
+            not_shown?: boolean;
+            client_abandoned?: boolean;
+            model_versions?: {
+                [key: string]: string;
+            } | null;
             slate?: {
                 item_id?: string;
                 position?: number;
@@ -2667,14 +2711,47 @@ export interface components {
         /** @description The versioned recipe of a surface. Generators run in parallel, then filters, ranker, exploration. */
         FlowConfig: {
             generators: {
-                /** @enum {string} */
-                kind: "trending" | "curated" | "item_to_item" | "content_affinity" | "persona_bayes" | "user_bayes" | "surface_specific";
+                /**
+                 * @description session_items: neighbours (item_neighbours, else tag similarity) of what this session just looked at, recency-weighted (each step back keeps 0.85), an engaged view three times and a tap twice a plain view; every mode. time_fit: the item's tap rate in the request's time bucket (weekday/weekend x morning/day/evening/night from context.hour_bucket and weekday; item_time_profile), else a duration heuristic (short items fit the day, long ones the evening and the weekend); every mode. format_fit: the user's learned format preference (users.attributes.format_pref) against the item's format attribute; personalized only. Both are silent: they move scores and never name a reason. curated is a boost by rank (first item +2), not a z-score.
+                 * @enum {string}
+                 */
+                kind: "trending" | "curated" | "item_to_item" | "content_affinity" | "persona_bayes" | "user_bayes" | "surface_specific" | "session_items" | "time_fit" | "format_fit";
                 weight: number;
                 params?: Record<string, unknown>;
             }[];
             filters?: {
                 /** @default 7 */
                 exclude_seen_days?: number;
+                /**
+                 * @description items this person dismissed on any surface, or unpinned, stay out for this many days (by user id, or by session id without an identity). 0 = off. A preference: relaxed when nothing else is left.
+                 * @default 30
+                 */
+                exclude_dismissed_days?: number;
+                /**
+                 * @description items the user completed (item_completed) stay out for this many days; personalized mode. 0 = off.
+                 * @default 30
+                 */
+                exclude_consumed_days?: number;
+                /**
+                 * @description an item that showed this free user a paywall (paywall_viewed) stays out for this many days; applies when context.subscription_tier is free. 0 = off.
+                 * @default 7
+                 */
+                paywall_cooldown_days?: number;
+                /**
+                 * @description a product the user bought (user_purchases, from order_placed) is not offered again inside this window; the item's own repurchase_days attribute wins. 0 = off.
+                 * @default 30
+                 */
+                repurchase_days?: number;
+                /**
+                 * @description products whose available (or in_stock) attribute is false are never served; a hard rule, the same in both arms.
+                 * @default true
+                 */
+                hide_unavailable?: boolean;
+                /**
+                 * @description on an anchored request, only items whose similarity to the anchor (precomputed neighbours, else tag cosine) reaches this count as eligible for min_slots, so a block hides when nothing is relevant, in both arms alike. 0 = off.
+                 * @default 0
+                 */
+                relevance_floor?: number;
                 locales?: string[];
                 /**
                  * @default cap
@@ -2691,6 +2768,11 @@ export interface components {
                  * @default 0
                  */
                 diversity?: number;
+                /**
+                 * @description added to the score of items whose region is the request's context.region (generators are z-scores times their weights, so 0.3 is a modest lift); other items are never hidden. Logged per candidate as the contribution region_match; it never wins a slot's reason.
+                 * @default 0.3
+                 */
+                region_boost?: number;
             };
             ranker: {
                 /**
@@ -2700,6 +2782,11 @@ export interface components {
                 kind: "linear" | "learned_linear" | "gbdt";
                 /** @description a `policies.version`; empty means the built-in linear weights */
                 policy_version?: string;
+                /**
+                 * @description Thompson-sampling mixture: per request, each generator's weight is multiplied by a draw from its Beta posterior (generator_arms, fitted nightly from logged contributions and taps on treatment and none slates) over the mean draw. The sampled weights are logged in the impression's model_versions (w:<generator>, and bandit: the posterior version), so every slate's propensities are exact given them and Simulate re-weights from them. Never in the control arm; a generator without a posterior keeps its weight.
+                 * @default false
+                 */
+                bandit?: boolean;
             };
             exploration: {
                 /** @enum {string} */
@@ -2778,11 +2865,14 @@ export interface components {
              *     join_rate (surfaces that serve communities, else 400 metric_not_applicable): a
              *     community_joined for a community in the slate within 7 days, by the slate's user,
              *     session or request. engaged_after_tap: item_engaged or item_completed for a tapped item
-             *     within 7 days of the tap, same identity match. Unmeasured slates are outside every
+             *     within 7 days of the tap, same identity match. purchase_rate (surfaces that serve
+             *     products, else 400 metric_not_applicable): an order_placed whose product_ids contain an
+             *     item of the slate, within 7 days after the slate's first tap, same identity match.
+             *     Unmeasured slates are outside every
              *     metric; a not-shown slate counts as served with no success.
              * @enum {string}
              */
-            primary_metric: "tap_rate" | "second_item_rate" | "join_rate" | "engaged_after_tap";
+            primary_metric: "tap_rate" | "second_item_rate" | "join_rate" | "engaged_after_tap" | "purchase_rate";
             /**
              * @description persona: each persona stratum (none for requests without a persona) is hashed on its own against its share
              * @default none
@@ -2900,6 +2990,8 @@ export interface components {
             actor_email?: string | null;
             action?: string;
             target?: string;
+            /** @description what the target names, for display: a panel user's email (a user id target), an item's title (claim_tag:<kind>/<external_id>/<tag>), a surface's name, or '<surface name> v<version>' for a flow (<surface>@<version>); null when the engine cannot resolve it */
+            target_label?: string | null;
             diff?: Record<string, unknown> | null;
             /** Format: date-time */
             at?: string;
@@ -2942,6 +3034,9 @@ export interface components {
                 actor_email?: string | null;
                 action?: string;
                 target?: string;
+                /** @description as on AuditEntry */
+                target_label?: string | null;
+                diff?: Record<string, unknown> | null;
             }[];
             /** @description the newest weekly analyst note of the data set (include_synthetic), or null */
             analyst_note?: components["schemas"]["AnalystNote"] | null;
@@ -3047,6 +3142,20 @@ export interface components {
                 explored?: boolean;
                 shadow?: boolean;
                 latency_ms?: number;
+                /**
+                 * @description editorial slates only (see Slate.control_source)
+                 * @enum {string|null}
+                 */
+                control_source?: "request" | "by_anchor" | "surface" | null;
+                /** @description trailing slots filled from the editorial list */
+                fill_count?: number;
+                /** @description answered shown:false (fewer than min_slots items passed) */
+                not_shown?: boolean;
+                client_abandoned?: boolean;
+                /** @description every model artifact the slate read: persona_bayes, user_bayes, item_sim, ranker, gbdt */
+                model_versions?: {
+                    [key: string]: string;
+                } | null;
                 slots?: {
                     item_id?: string;
                     position?: number;
@@ -3168,6 +3277,8 @@ export interface components {
             two_person_rule?: boolean;
             /** @description serve phase_fit item metadata in slates (off by default) */
             phase_tags?: boolean;
+            /** @description the coarse regions context.region and item region may name */
+            regions?: string[];
             /** Format: date-time */
             suspended_at?: string | null;
             paused?: boolean;
@@ -3230,6 +3341,8 @@ export interface components {
             two_person_rule?: boolean;
             /** @description turn phase_fit item metadata on in slates and the importer */
             phase_tags?: boolean;
+            /** @description replaces the tenant's region list (unique names, coarse areas such as provinces or countries; never coordinates); [] clears it */
+            regions?: string[];
             webhooks?: components["schemas"]["WebhookEndpoint"][];
             /** @description 24 to 200 random characters the PostHog destination sends in X-Patterna-Token; stored as its SHA-256; empty removes it */
             posthog_token?: string;
@@ -3267,7 +3380,7 @@ export interface components {
         Notification: {
             id?: string;
             /** @enum {string} */
-            kind?: "srm" | "fallback_rate" | "connector_failure" | "ledger_published" | "flow_activated" | "deletion_completed" | "approval_requested" | "approval_decided" | "surface_status" | "alert_test" | "workspace_deletion" | "report_sent";
+            kind?: "srm" | "fallback_rate" | "connector_failure" | "ledger_published" | "flow_activated" | "deletion_completed" | "approval_requested" | "approval_decided" | "surface_status" | "alert_test" | "workspace_deletion" | "report_sent" | "quota_warning";
             message?: string;
             target?: string;
             /** Format: date-time */
@@ -3437,6 +3550,11 @@ export interface components {
              */
             created_at: string;
             active_sessions: number;
+            /**
+             * Format: date-time
+             * @description the person skipped two-step enrolment ('Skip for now') and may work without it until then; null when not deferred, expired or MFA is on
+             */
+            mfa_deferred_until?: string | null;
         };
         Invite: {
             id: string;
@@ -4222,6 +4340,8 @@ export interface operations {
                 /** @description RFC 3339 */
                 changed_since?: string;
                 kind?: string;
+                /** @description only items of this region */
+                region?: string;
                 status?: string;
                 cursor?: string;
                 limit?: number;

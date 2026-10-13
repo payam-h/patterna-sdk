@@ -1,9 +1,42 @@
 # Changelog: patterna-sdk (Python)
 
-SDK 0.2 needs engine 0.2 or later (the engine in production since release `7a7683e`).
+SDK 0.2 to 0.4 need engine 0.2 or later (the engine in production since release `7a7683e`).
 
 Not on PyPI. Install from the public repository:
-`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.3.0#subdirectory=python"`.
+`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"`.
+
+## 0.4.0 (2026-10-13)
+
+Typed support for engine round 5 (API 0.3.0); older engines ignore the new keys. Compatible with
+0.3. The shared signing and assignment-unit vectors are unchanged.
+
+### Added
+
+- **Request context**: `weekday` (0 = Monday), `subscription_tier`, `tenure_days` next to
+  `hour_bucket`, `platform`, `region` and `session_items`, checked before sending;
+  `RecommendContext` and `EventContext` TypedDicts; `time_context(at, tz)` returns
+  `{"hour_bucket", "weekday"}` in the user's zone; `TIER_FREE`, `TIER_PREMIUM`.
+- **Event context**: `weekday`, `region`, `subscription_tier`, `tenure_days` are allowed and
+  checked in `ingest_events`.
+- **Editorial attributes**: `ItemAttributes` (format, duration and reading time, difficulty,
+  author, availability, expiry, event start, repurchase window, region, phase fit, and the
+  panel's price, compare-at price, currency, image, URL, product type, categories) as an item's
+  `editorial` (or a dict of its fields), written into `attributes` with datetimes as RFC 3339
+  UTC and `region` lifted to the top-level `region`.
+- **Activity events**: `community_post_created`, `community_reply`, `community_reaction`,
+  `paywall_viewed`, `push_opened`, `search_performed`, `item_engaged`, `item_completed`,
+  `order_placed` on an `EventBase`, with the consent rule (user id in personalized and cohort,
+  session id only in non_profiled) and the `EVENT_*` type constants.
+- **Reasons**: `REASON_RECOMMENDED`, `REASON_KEYS`.
+- **Flows**: `validate_flow_config`, `GENERATOR_KINDS` (with `time_fit`, `format_fit`),
+  `FlowFilters` (TypedDict with the six new filters).
+
+### Changed
+
+- `create_flow`, `plan_flow` and `apply_flow` validate the config before sending (`create_flow`
+  used to check only that it was a dict); an unknown filter key now fails here.
+- `upsert_items` sends each item through the editorial merge and refuses out-of-range attributes.
+- User agent `patterna-sdk-python/0.4.0`.
 
 ## 0.3.0 (2026-10-13)
 

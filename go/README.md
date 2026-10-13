@@ -1,11 +1,12 @@
 # sdk-go: `github.com/payam-h/patterna-sdk/go`
 
-Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (anchored control
+Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (anchored control
 lists, `shown: false`, fill) need engine 0.3 (API 0.2.0, `engine_version` 0.2.0), the engine in
-production.
+production; the 0.4 fields (request context, editorial attributes, activity events, the new flow
+generators and filters) take effect with engine round 5 (API 0.3.0) and are ignored before it.
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.3.0   # tag go/v0.3.0 in payam-h/patterna-sdk
+go get github.com/payam-h/patterna-sdk/go@v0.4.0   # tag go/v0.4.0 in payam-h/patterna-sdk
 ```
 
 Go client for the Patterna API, built for a customer backend in a request path (Elvou's Gin +
@@ -161,6 +162,83 @@ if rec.Slate != nil {
   that look like an email or an identity-provider subject are refused everywhere, and never
   appear in error text.
 
+## Signals: context, editorial attributes, activity events (engine round 5)
+
+Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+
+**Request context.** Next to `HourBucket`, `Platform`, `Region` and `SessionItems`:
+
+```go
+req.Context.SetLocalTime(time.Now(), userLoc)  // HourBucket and Weekday (0 = Monday) in the user's timezone
+req.Context.SubscriptionTier = patterna.TierFree // or TierPremium, or your own tier name (<= 32 chars)
+req.Context.TenureDays = patterna.Ptr(daysSinceSignup)
+req.Context.Region = "Noord-Holland"            // one of the tenant's regions; never a location
+req.Context.SessionItems = recentlyOpenedIDs    // most recent first, at most 20
+```
+
+`patterna.LocalTime(t, loc)` returns the two numbers when you need them elsewhere;
+`EventContext.SetLocalTime` does the same for events. Out-of-range values (weekday 0..6, hour
+0..23, negative tenure, a tier over 32 or a region over 64 characters, more than 20 session
+items) fail before the request leaves. For `free` the engine applies the premium policy and the
+paywall cooldown; none of these is stored on the user.
+
+**Editorial attributes.** `ItemUpsert.Editorial` is the typed form of `attributes`:
+
+```go
+pc.UpsertItems(ctx, []patterna.ItemUpsert{{
+	ExternalID: "p_magnesium", Kind: patterna.KindProduct, Title: "Magnesium", Locale: "nl",
+	Editorial: &patterna.ItemAttributes{
+		Format: patterna.FormatProduct, Available: patterna.Ptr(inStock), RepurchaseDays: patterna.Ptr(30),
+		PriceCents: patterna.Ptr(2495), Currency: "EUR", ImageURL: img, URL: shopURL, ProductType: "supplement",
+	},
+}})
+```
+
+The engine reads `Format`, `DurationMin`/`ReadingTimeMin`, `Difficulty`, `Author`, `Available`
+(false is never served), `ExpiresAt`, `StartsAt` (events), `RepurchaseDays`, `Region` and
+`PhaseFit`; the panel shows `PriceCents`, `CompareAtCents`, `Currency`, `ImageURL`, `URL`,
+`ProductType` and `Categories`. A typed field wins over the same key in `Attributes`, which keeps
+any other keys. `Region` is sent as the upsert's top-level `region` (the field the engine
+validates and ranks on); `ItemUpsert.Region` is the same field.
+
+Products from a Shopify store do not need this call: the jobs CLI syncs the public storefront
+(`python -m patterna_jobs shopify-storefront --tenant <slug> --shop-url https://<shop>`) and
+turns an orders export into co-purchase pairs (`orders-csv --csv <file>`). There is no admin API
+call for either; run them where the jobs run.
+
+**Activity events.** One builder per event, all on `EventBase` (mode, ids, envelope):
+
+```go
+who := patterna.EventBase{Mode: mode, UserID: patternaID, SessionID: sessionID}
+e, err := patterna.CommunityReply(who, patterna.CommunityPost{PostID: p, CommunityID: c})
+e, err = patterna.CommunityPostCreated(who, patterna.CommunityPost{PostID: p, CommunityID: c})
+e, err = patterna.CommunityReaction(who, patterna.CommunityPost{PostID: p, CommunityID: c, Reaction: "heart"})
+e, err = patterna.PaywallViewed(who, itemID)          // who.RequestID: the slate it came from
+e, err = patterna.PushOpened(who, itemID, "weekly_digest")
+e, err = patterna.SearchPerformed(who, patterna.Search{QueryHash: h, ResultCount: patterna.Ptr(n), ClickedItemID: id})
+e, err = patterna.ItemEngaged(who, patterna.Engagement{ItemID: id, EngagedSeconds: 42, MaxScrollPercent: 80})
+e, err = patterna.ItemCompleted(who, workoutID, patterna.KindDocument, "workouts")
+e, err = patterna.OrderPlaced(who, patterna.Order{OrderIDHash: h, ProductIDs: ids, ValueCents: patterna.Ptr(4990), Currency: "EUR"})
+```
+
+Identity follows consent: `personalized` and `cohort` carry the user id (required) and the
+session id when given (the session generator and the paywall cooldown read it); `non_profiled`
+carries the session id only and a user id is refused. `QueryHash` must be 16 to 128 lowercase
+hex characters (hash the query yourself, e.g. HMAC-SHA256 with a key you hold), so query text
+cannot travel by mistake. `item_completed` and `order_placed` are ranking events: sign them
+with `patterna.SignEvent` when they do not come from an ingest key.
+
+**Reasons.** A slot the engine cannot truthfully explain says `ReasonRecommended`
+(`"recommended"`, "Aanbevolen"/"Recommended"). `patterna.ReasonKeys` lists every key; treat an
+unknown one like `recommended`.
+
+**Flows.** `admin.FlowConfig` is the typed recipe, with the generators `admin.GenTimeFit` and
+`admin.GenFormatFit` (silent: they move scores and never name a reason) and the filters
+`ExcludeDismissedDays`, `ExcludeConsumedDays`, `PaywallCooldownDays`, `RepurchaseDays`,
+`HideUnavailable` and `RelevanceFloor`. `admin.ValidateFlowConfig` checks a raw config as the
+engine does on save, plus unknown filter keys; `CreateFlow`, `PlanFlow`, `ApplyFlow` and
+`patterna flow apply` run it before anything is sent (the CLI checks every file first).
+
 ## AI coach: products named in an answer
 
 ```go
@@ -269,7 +347,7 @@ surface calls read it back, so they return the surface after the change.
 The CLI keeps flow configs in your repository and applies them in CI:
 
 ```sh
-go install github.com/payam-h/patterna-sdk/go/cmd/patterna@go/v0.3.0
+go install github.com/payam-h/patterna-sdk/go/cmd/patterna@go/v0.4.0
 export PATTERNA_URL=https://patterna-api.orven.am/v1 PATTERNA_ADMIN_KEY=...   # CI secret, never a flag
 
 patterna flow get --surface more_to_read > patterna/flows/more_to_read.json  # once, to start
@@ -322,7 +400,7 @@ path to `github.com/payam-h/patterna-sdk/go`, and tags `v<version>` and `go/v<ve
 then needs nothing but:
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.3.0
+go get github.com/payam-h/patterna-sdk/go@v0.4.0
 ```
 
 Bump `CHANGELOG.md` with each release. A v2 would need `/v2` at the end of the public module path.
@@ -335,7 +413,10 @@ reporting with drain on Close, `RecommendWithFallback` and `RecommendMany`, cons
 checks, assignment units, event signing with the cross-language vector, typed errors, the admin
 package and the CLI, and every engine 0.3 field (control lists, `member_of`, `control_source`,
 fill, `shown: false`, coach product events, `mode_required`, `not_shown`, surface files, phase
-tags, per-block ledger rows, `engine_version`). Table-driven tests with `httptest` and an
+tags, per-block ledger rows, `engine_version`) and engine round 5 (the coarse request context
+and `LocalTime`, typed editorial attributes, nine activity-event builders, the `recommended`
+reason key, typed and validated flow configs with `time_fit`, `format_fit` and the six new
+filters). Table-driven tests with `httptest` and an
 in-memory fake engine (`internal/fakeengine`; race detector on), `go vet` and `staticcheck` clean.
 
 Deliberately left out:

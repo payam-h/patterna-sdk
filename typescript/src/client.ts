@@ -1,6 +1,7 @@
 import { assertIdentityAllowed, assertMode, assertOpaqueUserId } from "./consent.js";
 import { ApiError, ApiErrorCode, ErrorCode, isCallerBug, PatternaError, ValidationError } from "./errors.js";
 import { newRequestId, Transport, type FetchLike, type RequestSpec } from "./http.js";
+import { checkCoarseContext, checkSessionItems, itemWire, validateFlowConfig } from "./signals.js";
 import { canonicalJson } from "./signing.js";
 import type {
   AbandonReason,
@@ -66,7 +67,16 @@ const MAX_CONTROL_ITEMS = 50;
 const MAX_MEMBER_OF = 500;
 const MAX_LEDGER_BLOCK = 32;
 const FALLBACK_KINDS = new Set(["newest", "popular", "curated"]);
-const EVENT_CONTEXT_KEYS = new Set(["locale", "app_version", "platform", "hour_bucket"]);
+const EVENT_CONTEXT_KEYS = new Set([
+  "locale",
+  "app_version",
+  "platform",
+  "hour_bucket",
+  "weekday",
+  "region",
+  "subscription_tier",
+  "tenure_days",
+]);
 
 export interface PatternaClientOptions {
   /** e.g. `https://api.patterna.ainur.dev/v1`, or the customer's proxy that forwards to it. */
@@ -193,6 +203,8 @@ export class PatternaClient {
     if ((req.context.member_of?.length ?? 0) > MAX_MEMBER_OF) {
       invalid(op, `context.member_of is limited to ${MAX_MEMBER_OF}`);
     }
+    checkCoarseContext(req.context, op);
+    checkSessionItems(req.context.session_items, op);
     if (req.assignment_unit !== undefined && !HMAC_HEX.test(req.assignment_unit)) {
       invalid(op, "assignment_unit must be assignmentUnit(secret, userId): 64 lowercase hex characters, never a raw id");
     }
@@ -338,11 +350,12 @@ export class PatternaClient {
   async upsertItems(items: ItemUpsert[], opts: CallOptions = {}): Promise<UpsertItemsResult> {
     const op = "upsertItems";
     if (items.length > MAX_ITEMS) invalid(op, `at most ${MAX_ITEMS} items per call`);
+    const wire = items.map((it, i) => itemWire(it, i, op));
     const res = await this.http.send<UpsertItemsResult>({
       op,
       method: "PUT",
       path: "/catalog/items",
-      body: { items },
+      body: { items: wire },
       scope: "ingest",
       timeoutMs: opts.timeoutMs ?? this.ingestMs,
       idempotent: true,
@@ -692,7 +705,7 @@ export class PatternaClient {
   async createFlow(surface: string, config: FlowConfig, note?: string, opts: CallOptions = {}): Promise<Flow> {
     const op = "createFlow";
     if (!surface) invalid(op, "surface key is required");
-    if (typeof config !== "object" || config === null || Array.isArray(config)) invalid(op, "config must be an object");
+    validateFlowConfig(config, op);
     const res = await this.admin<Flow>(
       {
         op,
@@ -741,6 +754,7 @@ export class PatternaClient {
 
   /** What applyFlow would do, without writing anything. */
   async planFlow(surface: string, config: FlowConfig, activate = true, opts: CallOptions = {}): Promise<ApplyResult> {
+    validateFlowConfig(config, "applyFlow");
     const want = canonicalJson(config);
     const s = await this.getSurface(surface, opts);
     const flows = await this.listFlows(surface, opts);
@@ -1019,8 +1033,9 @@ export function validateEvent(e: Event, op: string): void {
   if (e.context) {
     for (const key of Object.keys(e.context)) {
       if (!EVENT_CONTEXT_KEYS.has(key)) {
-        invalid(op, `event context key "${key}" is not allowed (locale, app_version, platform, hour_bucket)`);
+        invalid(op, `event context key "${key}" is not allowed (${[...EVENT_CONTEXT_KEYS].join(", ")})`);
       }
     }
+    checkCoarseContext(e.context, op, "event context");
   }
 }

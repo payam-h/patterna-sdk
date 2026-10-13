@@ -1,17 +1,19 @@
 # patterna-sdk
 
-Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (control lists,
+Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 fields (control lists,
 `shown: false`, fills, coach events, the new admin calls) need engine 0.3 (`engine_version`
-0.2.0), which is the engine in production.
+0.2.0), which is the engine in production; the 0.4 fields (request context, editorial
+attributes, activity events, the new flow generators and filters) take effect with engine round 5
+(API 0.3.0) and are ignored before it.
 
 **Install.** The npm name is `patterna-sdk`, and it is not published yet: `npm install
 patterna-sdk` returns 404 today. Until it is, build it from the public repository
-[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.3.0`:
+[payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) at tag `v0.4.0`:
 
 ```sh
-git clone --branch v0.3.0 https://github.com/payam-h/patterna-sdk.git
-cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.3.0.tgz
-cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.3.0.tgz
+git clone --branch v0.4.0 https://github.com/payam-h/patterna-sdk.git
+cd patterna-sdk/typescript && npm ci && npm run build && npm pack   # patterna-sdk-0.4.0.tgz
+cd /your/app && npm install /path/to/patterna-sdk/typescript/patterna-sdk-0.4.0.tgz
 ```
 
 In this monorepo the package is `@patterna/sdk` (private); the release script renames it.
@@ -148,6 +150,83 @@ await patterna.ingestEvents([
 text), `position` the 0-based place among the answer's products. The helpers apply the consent
 rules (user id in personalized and cohort, session id only in non_profiled) and default
 `event_id`, `occurred_at` and `source: "backend"`.
+
+### Signals: context, editorial attributes, activity events (engine round 5)
+
+Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+
+```ts
+import { timeContext, TIER_FREE } from "patterna-sdk";
+
+await patterna.recommend({
+  surface: "home_articles", mode: "personalized", user_id,
+  context: {
+    locale: "nl",
+    ...timeContext(new Date(), user.timeZone), // hour_bucket and weekday (0 = Monday) in the user's zone
+    subscription_tier: TIER_FREE,              // "premium" or your own tier name (<= 32 chars)
+    tenure_days: daysSinceSignup,
+    region: "Noord-Holland",                   // one of the tenant's regions; never a location
+    session_items: recentlyOpenedIds,          // most recent first, at most 20
+  },
+});
+```
+
+Without a time zone `timeContext` reads the device clock. Out-of-range values fail before the
+request leaves; the same keys are allowed (and checked) in an event's `context`. For `free` the
+engine applies the premium policy and the paywall cooldown; none of these is stored on the user.
+
+**Editorial attributes.** `editorial` on an upsert is the typed form of `attributes`:
+
+```ts
+await patterna.upsertItems([{
+  external_id: "p_magnesium", kind: "product", title: "Magnesium", locale: "nl",
+  editorial: { format: "product", available: inStock, repurchase_days: 30, price_cents: 2495,
+               currency: "EUR", image_url, url: shopUrl, product_type: "supplement" },
+}]);
+```
+
+The engine reads `format`, `duration_min`/`reading_time_min`, `difficulty`, `author`,
+`available` (false is never served), `expires_at`, `starts_at` (events; strings in RFC 3339 or
+`Date`), `repurchase_days`, `region` and `phase_fit`; the panel shows `price_cents`,
+`compare_at_cents`, `currency`, `image_url`, `url`, `product_type` and `categories`. A typed key
+wins over the same key in `attributes`, which keeps any others. `region` is sent as the upsert's
+top-level `region`, the field the engine validates and ranks on.
+
+Products from a Shopify store do not need this call: the jobs CLI syncs the public storefront
+(`python -m patterna_jobs shopify-storefront --tenant <slug> --shop-url https://<shop>`) and
+turns an orders export into co-purchase pairs (`orders-csv --csv <file>`). There is no admin API
+call for either; run them where the jobs run.
+
+**Activity events**, each with the envelope fields of `EventBase` (`mode`, `userId`,
+`sessionId`, `surface`, `requestId`, `occurredAt`, `eventId`, `source`, `context`):
+
+```ts
+communityPostCreated({ mode, userId, postId, communityId });
+communityReply({ mode, userId, postId, communityId });
+communityReaction({ mode, userId, postId, communityId, reaction: "heart" });
+paywallViewed({ mode, userId, itemId, requestId });           // requestId: the slate it came from
+pushOpened({ mode, userId, itemId, notificationType: "weekly_digest" });
+searchPerformed({ mode, sessionId, queryHash, resultCount, clickedItemId });
+itemEngaged({ mode, userId, itemId, engagedSeconds: 42, maxScrollPercent: 80 });
+itemCompleted({ mode, userId, itemId, kind: "document", collection: "workouts" });
+orderPlaced({ mode, userId, orderIdHash, productIds, valueCents: 4990, currency: "EUR" });
+```
+
+Identity follows consent: `personalized` and `cohort` carry the user id (required) and the
+session id when given; `non_profiled` carries the session id only and a user id is refused.
+`queryHash` must be 16 to 128 lowercase hex characters (hash the query yourself, e.g.
+HMAC-SHA256 with a key you hold), so query text cannot travel by mistake. `item_completed` and
+`order_placed` are ranking events: `signEvent` them when they do not come from an ingest key.
+
+**Reasons.** A slot the engine cannot truthfully explain says `REASON_RECOMMENDED`
+(`"recommended"`, "Aanbevolen"/"Recommended"); `REASON_KEYS` lists every key. Treat an unknown
+key like `recommended`.
+
+**Flows.** `FlowConfig` carries the generators `time_fit` and `format_fit` (silent: they move
+scores and never name a reason; `GENERATOR_KINDS`) and the filters `exclude_dismissed_days`,
+`exclude_consumed_days`, `paywall_cooldown_days`, `repurchase_days`, `hide_unavailable` and
+`relevance_floor` (type `FlowFilters`). `validateFlowConfig` checks a config as the engine does
+on save, plus unknown filter keys; `createFlow`, `planFlow` and `applyFlow` run it first.
 
 ### Several surfaces in one call
 
@@ -403,7 +482,10 @@ runtime, opaque-user-id checks, `withFallback`, `EventQueue` (bounded, persisten
 AsyncStorage-shaped store, consent-aware, idempotent restore), HMAC signing with a cross-language
 vector, assignment units, session ids, and engine 0.3: control lists, `member_of`,
 `control_source`, fills, `shown` on every result, `mode_required` and `not_shown`, coach product
-events, surface apply, block ledger rows, surface metrics, phase tags and health. 113 tests with
+events, surface apply, block ledger rows, surface metrics, phase tags and health; and engine
+round 5: the coarse request context with `timeContext`, typed editorial attributes, nine
+activity-event builders, the `recommended` reason key and `validateFlowConfig` with `time_fit`,
+`format_fit` and the six new filters. 185 tests with
 mocked fetch and a small in-memory engine. ESM + CJS + d.ts via tsup.
 
 Deliberately left out:
@@ -414,7 +496,7 @@ Deliberately left out:
   the per-call budget are enough.
 - No persistent queue for abandonments: they are fire-and-forget promises. In a backend that
   shuts down, a few may be lost; the Go SDK drains its queue on `Close`.
-- Not on npm yet: publishing `patterna-sdk` 0.3.0 is pending. Build it from the public
+- Not on npm yet: publishing `patterna-sdk` 0.4.0 is pending. Build it from the public
   repository as shown at the top.
 
 Settled since 0.1: the user endpoints (`/users/{id}/mode`, `/users/{id}/profile`,

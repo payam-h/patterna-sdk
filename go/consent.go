@@ -76,6 +76,9 @@ func validateRecommend(req RecommendRequest) error {
 	if len(req.Context.MemberOf) > maxMemberOf {
 		return newError(CodeInvalidArgument, op, "context.member_of is limited to %d", maxMemberOf)
 	}
+	if err := validateRecommendContext(op, req.Context); err != nil {
+		return err
+	}
 	if req.AssignmentUnit != "" && !hmacHex.MatchString(req.AssignmentUnit) {
 		return newError(CodeInvalidArgument, op,
 			"assignment_unit must be AssignmentUnit(secret, userID): 64 lowercase hex characters, never a raw id")
@@ -86,6 +89,11 @@ func validateRecommend(req RecommendRequest) error {
 func validateEvent(op string, e Event) error {
 	if e.EventID == "" || e.Type == "" || e.Source == "" || e.OccurredAt.IsZero() {
 		return newError(CodeInvalidArgument, op, "event_id, type, source and occurred_at are required")
+	}
+	if c := e.Context; c != nil {
+		if err := validateCoarseContext(op, "event context", c.HourBucket, c.Weekday, c.TenureDays, c.SubscriptionTier, c.Region); err != nil {
+			return err
+		}
 	}
 	if e.UserID != "" {
 		return CheckUserID(op, e.UserID)

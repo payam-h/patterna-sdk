@@ -1,17 +1,19 @@
 # patterna-sdk (Python)
 
-Version 0.3.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 additions need engine 0.3
-(API 0.2.0), which is the engine in production.
+Version 0.4.0 (see `CHANGELOG.md`). Needs engine 0.2 or later; the 0.3 additions need engine 0.3
+(API 0.2.0), which is the engine in production; the 0.4 additions (request context, editorial
+attributes, activity events, the new flow generators and filters) take effect with engine round 5
+(API 0.3.0) and are ignored before it.
 
 Python client for the Patterna API, with the same shape as `patterna-sdk` (TypeScript) and the
 Go SDK: serve, ingest and admin calls, a consent gate, typed errors, one retry on idempotent
 calls, client-minted request ids with abandonment, and event signatures and assignment units that
 share test vectors across the three SDKs. No dependencies: `urllib` and `hmac` only. Python 3.10+.
 
-Not on PyPI. Install it from the public repository at tag `v0.3.0`:
+Not on PyPI. Install it from the public repository at tag `v0.4.0`:
 
 ```sh
-pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.3.0#subdirectory=python"
+pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"
 # inside this monorepo: pip install -e packages/sdk-py
 ```
 
@@ -176,6 +178,102 @@ patches only the fields that differ (`plan_surface` says which, writing nothing)
 is replaced as a whole. `surface_metrics(key, days=, block=)` adds `not_shown_share` and
 `client_abandoned_rate`; `ledger_by_block()` returns one row per surface and block;
 `set_phase_tags(True)` turns `phase_fit` on; `health()["engine_version"]`.
+
+## Engine round 5: context, editorial attributes, activity events
+
+Everything the engine reads is listed in `docs/SIGNALS.md`; these are the SDK's parts of it.
+
+```python
+from patterna_sdk import TIER_FREE, time_context
+
+patterna.recommend(
+    "home_articles",
+    mode="personalized",
+    user_id=pid,
+    context={
+        "locale": "nl",
+        **time_context(now, user_tz),  # hour_bucket and weekday (0 = Monday) in the user's zone
+        "subscription_tier": TIER_FREE,  # "premium" or your own tier name (<= 32 chars)
+        "tenure_days": days_since_signup,
+        "region": "Noord-Holland",  # one of the tenant's regions; never a location
+        "session_items": recently_opened,  # most recent first, at most 20
+    },
+)
+```
+
+`time_context(at, tz)` takes an aware datetime and an IANA name or tzinfo (stdlib `zoneinfo`;
+on Windows install `tzdata`); without `tz` it reads the datetime's own wall clock.
+`RecommendContext` and `EventContext` are the TypedDicts. Out-of-range values raise
+`ValidationError` before sending; the same keys are allowed (and checked) in an event's context.
+
+**Editorial attributes.** `editorial` on an item is the typed form of `attributes`
+(`ItemAttributes`, or a dict of its fields):
+
+```python
+patterna.upsert_items(
+    [
+        {
+            "external_id": "p_magnesium",
+            "kind": "product",
+            "title": "Magnesium",
+            "locale": "nl",
+            "editorial": ItemAttributes(
+                format="product",
+                available=in_stock,
+                repurchase_days=30,
+                price_cents=2495,
+                currency="EUR",
+                image_url=img,
+                url=shop_url,
+            ),
+        }
+    ]
+)
+```
+
+The engine reads `format`, `duration_min`/`reading_time_min`, `difficulty`, `author`,
+`available` (False is never served), `expires_at`, `starts_at` (events; aware datetimes or RFC
+3339 strings), `repurchase_days`, `region` and `phase_fit`; the panel shows `price_cents`,
+`compare_at_cents`, `currency`, `image_url`, `url`, `product_type` and `categories`. A typed key
+wins over the same key in `attributes`, which keeps any others. `region` is sent as the item's
+top-level `region`, the field the engine validates and ranks on.
+
+Products from a Shopify store do not need this call: the jobs CLI syncs the public storefront
+(`python -m patterna_jobs shopify-storefront --tenant <slug> --shop-url https://<shop>`) and
+turns an orders export into co-purchase pairs (`orders-csv --csv <file>`). There is no admin API
+call for either; run them where the jobs run.
+
+**Activity events**, each on an `EventBase(mode, user_id=, session_id=, surface=, request_id=,
+occurred_at=, event_id=, source=, context=)`:
+
+```python
+who = EventBase(mode=mode, user_id=pid, session_id=sid)
+community_post_created(who, post_id=p, community_id=c)
+community_reply(who, post_id=p, community_id=c)
+community_reaction(who, post_id=p, community_id=c, reaction="heart")
+paywall_viewed(who, item_id=item)  # who.request_id: the slate it came from
+push_opened(who, item_id=item, notification_type="weekly_digest")
+search_performed(who, query_hash=h, result_count=n, clicked_item_id=item)
+item_engaged(who, item_id=item, engaged_seconds=42, max_scroll_percent=80)
+item_completed(who, item_id=workout, kind="document", collection="workouts")
+order_placed(who, order_id_hash=h, product_ids=ids, value_cents=4990, currency="EUR")
+```
+
+Identity follows consent: personalized and cohort carry the user id (required) and the session
+id when given; non_profiled carries the session id only and a user id is refused. `query_hash`
+must be 16 to 128 lowercase hex characters (hash the query yourself, e.g. HMAC-SHA256 with a key
+you hold), so query text cannot travel by mistake. `item_completed` and `order_placed` are
+ranking events: a client with a `signing_secret` signs them in `ingest_events`.
+
+**Reasons.** A slot the engine cannot truthfully explain says `REASON_RECOMMENDED`
+(`"recommended"`, "Aanbevolen"/"Recommended"); `REASON_KEYS` lists every key. Treat an unknown
+key like `recommended`.
+
+**Flows.** `GENERATOR_KINDS` includes `time_fit` and `format_fit` (silent: they move scores and
+never name a reason); `FlowFilters` (TypedDict) has `exclude_dismissed_days`,
+`exclude_consumed_days`, `paywall_cooldown_days`, `repurchase_days`, `hide_unavailable` and
+`relevance_floor`. `validate_flow_config` checks a config as the engine does on save, plus
+unknown filter keys; `create_flow`, `plan_flow` and `apply_flow` run it first.
 
 ## Signing
 

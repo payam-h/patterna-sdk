@@ -20,7 +20,7 @@ Fields marked `pii` never exist. A connector that sees one drops it before the e
 | `source` | string | `backend`, `sdk`, `posthog`, `ga4`, `shopify`, `csv`, `synthetic` |
 | `signed` | bool | true when the event came from the backend or carries a valid HMAC |
 | `synthetic` | bool | generated rows; excluded from the ledger |
-| `context` | object | `locale`, `app_version`, `platform`, `hour_bucket`; nothing else |
+| `context` | object | `locale`, `app_version`, `platform`, `hour_bucket`, `weekday`, `region` (a tenant-configured coarse name), `subscription_tier`, `tenure_days`; nothing else (docs/SIGNALS.md) |
 | `props` | object | type-specific fields below |
 
 Precedence for identity: `user_id` from the backend, then the source's user id mapped through the
@@ -40,6 +40,7 @@ coordinates, or any health value (`pii`).
 | `item_pinned`, `item_unpinned` | `item_id` | explicit preference | app (new event) |
 | `community_joined`, `community_left` | `community_id`, `source` | strong positive / negative | backend |
 | `community_post_viewed` | `post_id`, `community_id` | weak positive | PostHog |
+| `community_post_created`, `community_reply`, `community_reaction` | `post_id`, `community_id` (`reaction` on the last) | strong positive on the community, mild on its tags; feeds the community's `activity_rate` | backend |
 | `event_rsvp`, `event_attended` | `event_id` | strong positive | backend |
 | `search_performed` | `query_hash`, `result_count`, `clicked_item_id` | intent | app (query hashed, never the text) |
 | `paywall_viewed` | `item_id`, `request_id` | funnel | app |
@@ -143,6 +144,35 @@ abandoned (below) and also stays in its arm, so engine-hidden and app-hidden blo
 A client that gave up on a slate (its deadline passed, or it hid the block) calls
 `POST /v1/recommendations/{request_id}/abandon`. The impression is flagged `fallback` and
 `client_abandoned`: it counts in the fallback rate and stays in its arm in the ledger.
+
+## Coarse request context: region
+
+A recommendation request may carry `context.region`: one of the regions the tenant named in
+Settings (`regions`, coarse areas such as provinces, countries or metro areas, at most 64
+characters each). It is per-request context like `locale` or `hour_bucket`: the engine stores it
+only with that request's impression (`impressions.region`), never on a user, in a profile or in
+an event, and never derives one from anything else. An item may carry the same kind of name
+(`region` on the catalog upsert). A flow's `filters.region_boost` lifts same-region items; other
+items are never hidden. A region is not a location: no coordinates, postcodes, addresses or IP
+addresses enter Patterna, and a name outside the tenant's list is refused (400 `unknown_region`).
+
+## Session context
+
+A session's own recent activity feeds the `session_items` generator: the slate items it reported
+`seen` or `click` through `/interactions` and its `item_engaged` events carrying its `session_id`,
+in the last day, plus `context.session_items` (item ids the client passes, most recent first).
+It is read by session id only, so it works in `non_profiled` mode without a user row; it is never
+joined to a user.
+
+## Engagement
+
+`item_engaged` counts as an **engaged view** when `engaged_seconds >= 20` or
+`max_scroll_percent >= 60`. Where the serve path weighs views, an engaged view weighs three plain
+views: the session generator weights its items engaged 3, tapped 2, seen 1; trending counts a tap
+followed within a day by an engaged view of the item (same user or session) as three taps; the
+cold-start popularity prior counts an engaged view three times. Each item's engagement rate
+(engaged views over views in 30 days, smoothed with a Beta(1, 9) prior) is a ranker feature
+(`engaged_rate`) and is logged with the candidates (`e`).
 
 ## Weights (default flow config, editable per tenant)
 

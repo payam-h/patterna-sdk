@@ -1,11 +1,43 @@
 # Changelog: patterna-sdk
 
-SDK 0.2 and 0.3 need engine 0.2 or later (the engine in production since release `7a7683e`).
+SDK 0.2 to 0.4 need engine 0.2 or later (the engine in production since release `7a7683e`).
 
 Published as `patterna-sdk` from [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk)
 (`typescript/`). The npm publish is pending: `npm install patterna-sdk` returns 404 today. Until
-then build it from that repository at tag `v0.3.0` (`npm ci && npm run build && npm pack` in
+then build it from that repository at tag `v0.4.0` (`npm ci && npm run build && npm pack` in
 `typescript/`) and install the tarball.
+
+## 0.4.0 (2026-10-13)
+
+Needs engine round 5 (API 0.3.0) for the new fields; older engines ignore them. Source-compatible
+with 0.3. The shared signing and assignment-unit vectors are unchanged.
+
+### Added
+
+- **Request context**: `weekday` (0 = Monday), `subscription_tier`, `tenure_days` next to
+  `hour_bucket`, `platform`, `region` and `session_items` (from the generated contract types),
+  checked before sending; `timeContext(date, timeZone?)` returns `{ hour_bucket, weekday }` in
+  the user's zone; `TIER_FREE`, `TIER_PREMIUM`.
+- **Event context**: `weekday`, `region`, `subscription_tier`, `tenure_days` are allowed and
+  checked.
+- **Editorial attributes**: `ItemAttributes` (format, duration and reading time, difficulty,
+  author, availability, expiry, event start, repurchase window, region, phase fit, and the
+  panel's price, compare-at price, currency, image, URL, product type, categories) as
+  `ItemUpsert.editorial`, written into `attributes` with `Date`s as RFC 3339 and `region` lifted
+  to the top-level `region`; `validateItemAttributes`; types `ItemFormat`, `Difficulty`.
+- **Activity events**: `communityPostCreated`, `communityReply`, `communityReaction`,
+  `paywallViewed`, `pushOpened`, `searchPerformed`, `itemEngaged`, `itemCompleted`,
+  `orderPlaced` on `EventBase`, with the consent rule (user id in personalized and cohort,
+  session id only in non_profiled) and the `EVENT_*` type constants.
+- **Reasons**: `REASON_RECOMMENDED`, `REASON_KEYS`, type `ReasonKey`.
+- **Flows**: `validateFlowConfig`, `GENERATOR_KINDS` (with `time_fit`, `format_fit`), types
+  `GeneratorKind` and `FlowFilters` (with the six new filters).
+
+### Changed
+
+- `createFlow`, `planFlow` and `applyFlow` validate the config before sending; a config that names
+  an unknown filter key now fails here.
+- `upsertItems` sends each item through the editorial merge and refuses out-of-range attributes.
 
 ## 0.3.0 (2026-10-13)
 

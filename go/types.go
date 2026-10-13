@@ -22,10 +22,27 @@ func (m Mode) Valid() bool {
 
 // RecommendContext is the request context. Nothing about the person goes here.
 type RecommendContext struct {
-	Locale         string   `json:"locale"`
-	AppVersion     string   `json:"app_version,omitempty"`
-	Platform       string   `json:"platform,omitempty"` // ios | android | web
-	HourBucket     *int     `json:"hour_bucket,omitempty"`
+	Locale     string `json:"locale"`
+	AppVersion string `json:"app_version,omitempty"`
+	Platform   string `json:"platform,omitempty"`    // ios | android | web
+	HourBucket *int   `json:"hour_bucket,omitempty"` // 0-23, the device clock; see SetLocalTime
+	// Weekday (engine round 5) is 0 = Monday ... 6 = Sunday in the user's timezone; with HourBucket it
+	// selects the time bucket time_fit reads. Absent, the engine derives it in the tenant's
+	// timezone. Set both with SetLocalTime.
+	Weekday *int `json:"weekday,omitempty"`
+	// SubscriptionTier (engine round 5): TierFree, TierPremium or a tenant-defined name (at most 32
+	// characters). For free the premium policy and the paywall cooldown apply. Never stored on
+	// the user.
+	SubscriptionTier string `json:"subscription_tier,omitempty"`
+	// TenureDays (engine round 5) is the account's age in days (bucketed by the engine to new,
+	// settled, long); a ranker feature only.
+	TenureDays *int `json:"tenure_days,omitempty"`
+	// Region (engine 0.3) is one of the region names the tenant configured (Settings), a coarse
+	// area and never a location; anything else answers 400 unknown_region. At most 64 characters.
+	Region string `json:"region,omitempty"`
+	// SessionItems (engine 0.3) are the item ids this session just looked at, most recent first,
+	// for the session_items generator. At most 20, each 1 to 200 characters; every mode.
+	SessionItems   []string `json:"session_items,omitempty"`
 	AnchorItemID   string   `json:"anchor_item_id,omitempty"`
 	Premium        *bool    `json:"premium,omitempty"`
 	CandidateKinds []string `json:"candidate_kinds,omitempty"`
@@ -193,11 +210,16 @@ type Interaction struct {
 }
 
 // EventContext is a closed set by design: no field here can carry personal data.
+// The round-5 keys (Weekday, Region, SubscriptionTier, TenureDays) are coarse by construction.
 type EventContext struct {
-	Locale     string `json:"locale,omitempty"`
-	AppVersion string `json:"app_version,omitempty"`
-	Platform   string `json:"platform,omitempty"`
-	HourBucket *int   `json:"hour_bucket,omitempty"`
+	Locale           string `json:"locale,omitempty"`
+	AppVersion       string `json:"app_version,omitempty"`
+	Platform         string `json:"platform,omitempty"`
+	HourBucket       *int   `json:"hour_bucket,omitempty"`
+	Weekday          *int   `json:"weekday,omitempty"` // 0 = Monday; see SetLocalTime
+	Region           string `json:"region,omitempty"`  // one of the tenant's region names
+	SubscriptionTier string `json:"subscription_tier,omitempty"`
+	TenureDays       *int   `json:"tenure_days,omitempty"`
 }
 
 // Event is a canonical event (contracts/events.md).
@@ -270,6 +292,12 @@ type ItemUpsert struct {
 	Premium     bool           `json:"premium"`
 	PublishedAt *time.Time     `json:"published_at,omitempty"`
 	Attributes  map[string]any `json:"attributes,omitempty"`
+	// Editorial (SDK 0.4) are the typed editorial attributes; they are written into attributes
+	// (a typed field wins over the same key in Attributes) and Editorial.Region into Region.
+	Editorial *ItemAttributes `json:"-"`
+	// Region is one of the tenant's regions (Settings), else 400 unknown_region; requests from
+	// that region rank the item up by the flow's region_boost. At most 64 characters.
+	Region string `json:"region,omitempty"`
 	// Text is body text for enrichment; stored only as embedding and tags, never returned.
 	Text string    `json:"text,omitempty"`
 	Tags []ItemTag `json:"tags,omitempty"`

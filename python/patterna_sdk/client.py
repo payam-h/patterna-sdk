@@ -36,6 +36,14 @@ from .errors import (
     is_caller_bug,
 )
 from .errors import TimeoutError as PatternaTimeout
+from .signals import (
+    EVENT_CONTEXT_KEYS,
+    RecommendContext,
+    check_coarse_context,
+    check_session_items,
+    item_wire,
+    validate_flow_config,
+)
 from .signing import canonical_json, sign_event
 
 MODES: tuple[str, ...] = ("personalized", "cohort", "non_profiled")
@@ -44,7 +52,7 @@ DEFAULT_RECOMMEND_DEADLINE_MS = 120
 DEFAULT_INGEST_TIMEOUT_MS = 5000
 DEFAULT_ADMIN_TIMEOUT_MS = 30000
 _MIN_SERVER_DEADLINE_MS = 10
-_CONTEXT_KEYS = frozenset({"locale", "app_version", "platform", "hour_bucket"})
+_CONTEXT_KEYS = EVENT_CONTEXT_KEYS
 _ITEM_KINDS = frozenset({"document", "product", "community", "event", "tip"})
 _SURFACE_STATUSES = frozenset({"shadow", "testers", "live", "off"})
 _ABANDON_REASONS = frozenset({"timeout", "server_error", "network_error", "bad_response", "client_fallback"})
@@ -339,7 +347,7 @@ class PatternaClient:
         trace_id: Callable[[], str | None] | None = None,
         on_background_error: Callable[[PatternaError], None] | None = None,
         slate_memory: int = 4096,
-        user_agent: str = "patterna-sdk-python/0.3.0",
+        user_agent: str = "patterna-sdk-python/0.4.0",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.keys = {"serve": serve_key, "ingest": ingest_key, "admin": admin_key}
@@ -395,7 +403,7 @@ class PatternaClient:
         mode: str,
         user_id: str | None = None,
         session_id: str | None = None,
-        context: dict[str, Any] | None = None,
+        context: RecommendContext | dict[str, Any] | None = None,
         slots: int | None = None,
         exclude_item_ids: Sequence[str] | None = None,
         assignment_unit: str | None = None,
@@ -414,6 +422,10 @@ class PatternaClient:
         here from fill_count when the engine does not send it). `model_versions` is decoded when
         present; engine 0.3 logs it on the impression only. A `shown: False` answer has no items:
         hide the block and never abandon it.
+
+        Engine round 5 context keys (`RecommendContext`): `weekday` (0 = Monday; fill it with
+        `hour_bucket` from `time_context`), `subscription_tier` and `tenure_days`, next to `region`
+        and `session_items`; out-of-range values raise ValidationError before sending.
         """
         if mode not in MODES:
             raise ConsentError(f"mode must be one of {MODES}", op="recommend", code="consent_required")
@@ -439,6 +451,8 @@ class PatternaClient:
                 raise _invalid("recommend", f"context.control_item_ids is limited to {_MAX_CONTROL_ITEMS}")
             if len(context.get("member_of") or ()) > _MAX_MEMBER_OF:
                 raise _invalid("recommend", f"context.member_of is limited to {_MAX_MEMBER_OF}")
+            check_coarse_context(context, "recommend")
+            check_session_items(context.get("session_items"), "recommend")
             body["context"] = context
         if slots is not None:
             body["slots"] = slots
@@ -605,6 +619,7 @@ class PatternaClient:
                         op="ingest_events",
                         code="invalid_context",
                     )
+                check_coarse_context(ev["context"], "ingest_events", "event context")
             if sign or (sign is None and self.signing_secret):
                 if not self.signing_secret:
                     raise ValidationError(
@@ -626,11 +641,14 @@ class PatternaClient:
     def upsert_items(
         self, items: Sequence[dict[str, Any]], *, timeout_ms: int | None = None
     ) -> dict[str, Any]:
+        """Upsert catalog items. An item's `editorial` (ItemAttributes, or a dict of its fields)
+        is written into `attributes` (a typed key wins) and its region into `region`."""
+        wire = [item_wire(it, i) for i, it in enumerate(items)]
         return self._call(
             "upsert_items",
             "PUT",
             "/catalog/items",
-            {"items": list(items)},
+            {"items": wire},
             "ingest",
             timeout_ms or self.ingest_timeout_ms,
         )
@@ -952,8 +970,7 @@ class PatternaClient:
         """Store a new, inactive version. Not retried: a lost answer would create a second version."""
         if not surface:
             raise _invalid("create_flow", "surface key is required")
-        if not isinstance(config, dict):
-            raise _invalid("create_flow", "config must be a dict")
+        validate_flow_config(config, "create_flow")
         body: dict[str, Any] = {"config": config}
         if note:
             body["note"] = note
@@ -989,7 +1006,8 @@ class PatternaClient:
         return target
 
     def plan_flow(self, surface: str, config: dict[str, Any], activate: bool = True) -> dict[str, Any]:
-        """What apply_flow would do, without writing anything."""
+        """What apply_flow would do, without writing anything. The config is validated first."""
+        validate_flow_config(config, "apply_flow")
         want = canonical_json(config)
         active = self.get_surface(surface).get("active_flow_version")
         version = 0

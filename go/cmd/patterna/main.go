@@ -262,6 +262,10 @@ func readFlowFiles(path string) ([]flowFile, error) {
 			if f.Surface == "" || len(f.Config) == 0 {
 				return nil, fmt.Errorf("%s: entry %d needs surface and config", p, i)
 			}
+			// every file is checked before the first one is applied
+			if err := admin.ValidateFlowConfig(f.Config); err != nil {
+				return nil, fmt.Errorf("%s: %s: %w", p, f.Surface, err)
+			}
 		}
 		out = append(out, many...)
 	}

@@ -212,6 +212,9 @@ func (c *Client) CreateFlow(ctx context.Context, surface string, config json.Raw
 	if !json.Valid(config) || len(bytes.TrimSpace(config)) == 0 || bytes.TrimSpace(config)[0] != '{' {
 		return nil, invalid(op, "config must be a JSON object")
 	}
+	if err := ValidateFlowConfig(config); err != nil {
+		return nil, err
+	}
 	body := map[string]any{"config": config}
 	if note != "" {
 		body["note"] = note
@@ -327,6 +330,9 @@ func (c *Client) PlanFlow(ctx context.Context, surface string, config json.RawMe
 	want, err := canonical(config)
 	if err != nil || len(want) == 0 || want[0] != '{' {
 		return nil, invalid("applyFlow", "config must be a JSON object")
+	}
+	if err := ValidateFlowConfig(config); err != nil {
+		return nil, err
 	}
 	s, err := c.GetSurface(ctx, surface, opts...)
 	if err != nil {

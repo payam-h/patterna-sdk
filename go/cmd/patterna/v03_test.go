@@ -99,3 +99,30 @@ func TestLedgerByBlock(t *testing.T) {
 		t.Errorf("calls %v", e.Calls)
 	}
 }
+
+// `flow apply` checks every file before the first is applied: a typo in the second file leaves
+// the first unapplied too.
+func TestFlowApplyValidatesRound5(t *testing.T) {
+	e := fakeengine.New("more_to_read", "home_products")
+	defer e.Close()
+	dir := t.TempDir()
+	write(t, dir, "a.json", `{"surface":"more_to_read","config":{"generators":[{"kind":"time_fit","weight":0.2},{"kind":"format_fit","weight":0.2}],
+"filters":{"exclude_dismissed_days":30,"exclude_consumed_days":30,"paywall_cooldown_days":7,"repurchase_days":30,"hide_unavailable":true,"relevance_floor":0.3},
+"ranker":{"kind":"linear"},"exploration":{"kind":"none"},"reasons":{"recommended":{"nl":"Aanbevolen"}}}}`)
+	write(t, dir, "b.json", `{"surface":"home_products","config":{"generators":[{"kind":"trending","weight":1}],"filters":{"relevance_flor":0.3},"ranker":{"kind":"linear"},"exploration":{"kind":"none"}}}`)
+	r := cli(t, e, "flow", "apply", "-f", dir)
+	if r.code != 1 || !strings.Contains(r.err, "b.json: home_products") || !strings.Contains(r.err, "unknown filter relevance_flor") {
+		t.Fatalf("code %d, out %q, err %q", r.code, r.out, r.err)
+	}
+	e.Mu.Lock()
+	n := len(e.Calls)
+	e.Mu.Unlock()
+	if n != 0 {
+		t.Fatalf("calls reached the engine: %d", n)
+	}
+	write(t, dir, "b.json", `{"surface":"home_products","config":{"generators":[{"kind":"trending","weight":1}],"filters":{"relevance_floor":0.3},"ranker":{"kind":"linear"},"exploration":{"kind":"none"}}}`)
+	r = cli(t, e, "flow", "apply", "-f", dir)
+	if r.code != 0 || !strings.Contains(r.out, "more_to_read: created and activated version 1") || !strings.Contains(r.out, "home_products: created and activated version 1") {
+		t.Fatalf("code %d, out %q, err %q", r.code, r.out, r.err)
+	}
+}

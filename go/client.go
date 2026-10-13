@@ -414,6 +414,11 @@ func (c *Client) UpsertItems(ctx context.Context, items []ItemUpsert, opts ...Ca
 	if len(items) > maxItems {
 		return nil, newError(CodeInvalidArgument, op, "at most %d items per call", maxItems)
 	}
+	for i, it := range items {
+		if err := validateItem(op, i, it); err != nil {
+			return nil, err
+		}
+	}
 	var out UpsertItemsResult
 	err := c.do(ctx, call{
 		op: op, method: http.MethodPut, path: "/catalog/items",

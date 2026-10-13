@@ -3,6 +3,7 @@
  * contracts/openapi.yaml via `make contracts`; edit the contract, never the generated file.
  */
 import type { components, operations } from "./generated/types.js";
+import type { ItemAttributes } from "./signals.js";
 
 type Schemas = components["schemas"];
 type JsonBody<Op> = Op extends { requestBody: { content: { "application/json": infer B } } } ? B : never;
@@ -42,9 +43,14 @@ export type Interaction = Schemas["Interaction"] & { block?: string };
 export type InteractionType = Interaction["type"];
 export type Event = Schemas["Event"];
 export type EventContext = NonNullable<Event["context"]>;
-export type ItemUpsert = Schemas["ItemUpsert"];
-export type ItemKind = ItemUpsert["kind"];
-export type ItemStatus = NonNullable<ItemUpsert["status"]>;
+/**
+ * A catalog item to create or update. `editorial` (SDK 0.4) is the typed form of the editorial
+ * attributes: the SDK writes it into `attributes` (a typed key wins) and its `region` into the
+ * top-level `region`.
+ */
+export type ItemUpsert = Schemas["ItemUpsert"] & { editorial?: ItemAttributes };
+export type ItemKind = Schemas["ItemUpsert"]["kind"];
+export type ItemStatus = NonNullable<Schemas["ItemUpsert"]["status"]>;
 export type UserProfile = Schemas["UserProfile"];
 export type DeletionRequest = Schemas["DeletionRequest"];
 
@@ -57,7 +63,10 @@ export type RecommendRequestBody = Schemas["RecommendRequest"];
 export type RecommendContext = RecommendRequestBody["context"] & { measured?: boolean };
 // control_item_ids (at most 50: your own editorial list for this page, the control slate) and
 // member_of (at most 500 community ids the user is in, never offered; for non_profiled) come
-// from the contract (engine 0.3).
+// from the contract (engine 0.3), as do region (one of the tenant's regions), session_items (at
+// most 20 ids, most recent first) and, from engine round 5, weekday (0 = Monday; fill it with
+// hour_bucket from `timeContext`), subscription_tier ("free", "premium" or a tenant tier) and
+// tenure_days.
 
 type RecommendCommon = Omit<RecommendRequestBody, "mode" | "user_id" | "session_id" | "context"> & {
   context: RecommendContext;

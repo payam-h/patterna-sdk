@@ -1,10 +1,26 @@
 # Changelog: patterna-sdk
 
-Current release: 0.4.0, published on npm as `patterna-sdk` (`npm install patterna-sdk@0.4.0`) from
+Current release: 0.4.1, published on npm as `patterna-sdk` (`npm install patterna-sdk@0.4.1`) from
 [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk) (`typescript/`). The production
 engine reports `engine_version: 0.3.1` (the contract version) and every field below is live on it;
 SDK 0.2 to 0.4 work against engine 0.2 or later, and older engines ignore the fields they do not
 know.
+
+## 0.4.1 (2026-10-13)
+
+No wire changes: nothing the SDK sends is different, and 0.4.0 keeps working. Source-compatible.
+
+### Added
+
+- `getItem(kind, externalId, opts?)`: `GET /catalog/items/{id}?kind=` under the ingest key,
+  returning the stored `Item` with `attributes`, `tags` (with `source`), `status` and `enrichment`.
+- `ApiErrorCode.ItemNotFound` (`item_not_found`, 404) for the catalog calls (`getItem`,
+  `deleteItem`, `setItemStatus`, `setItemTags`).
+
+### Fixed
+
+- `unknown_item` is the 422 from `reportInteractions` (an item that was not in the slate,
+  `details.unknown_item_ids`), not the catalog 404; the error table said the opposite.
 
 ## 0.4.0 (2026-10-13)
 

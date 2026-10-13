@@ -72,7 +72,7 @@ from .signals import (
 )
 from .signing import assignment_unit, canonical_json, compute_event_signature, sign_event
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "CONTROL_SOURCE_BY_ANCHOR",

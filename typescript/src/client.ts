@@ -461,8 +461,35 @@ export class PatternaClient {
   // ---- catalog (engine 0.2) ----------------------------------------------------------------
 
   /**
+   * Reads one catalog item by external id and kind (`GET /catalog/items/{id}?kind=`, ingest key):
+   * title, status, `attributes`, `tags` with their source, and the `enrichment` state. `kind` is
+   * required because the same external id may exist under several kinds. A missing item, or one
+   * stored under another kind, rejects with `item_not_found` (404); an archived item is returned
+   * with `status: "archived"`, so check it when you hydrate a card.
+   */
+  async getItem(kind: ItemKind, externalId: string, opts: CallOptions = {}): Promise<Item> {
+    const op = "getItem";
+    if (!externalId) invalid(op, "externalId is required");
+    if (!ITEM_KINDS.has(kind)) invalid(op, `unknown kind "${kind}"`);
+    const res = await this.http.send<Item>({
+      op,
+      method: "GET",
+      path: `/catalog/items/${encodeURIComponent(externalId)}`,
+      query: { kind },
+      scope: "ingest",
+      timeoutMs: opts.timeoutMs ?? this.ingestMs,
+      idempotent: true,
+      ...callExtras(opts),
+    });
+    if (!res.data || typeof res.data !== "object" || typeof res.data.external_id !== "string") {
+      throw new PatternaError({ code: ErrorCode.BadResponse, op, message: "item without external_id", status: res.status });
+    }
+    return res.data;
+  }
+
+  /**
    * Removes an item for good (engine 0.2: `DELETE /catalog/items/{id}?kind=`). Archive with
-   * setItemStatus when it may come back. A missing item rejects with `unknown_item`.
+   * setItemStatus when it may come back. A missing item rejects with `item_not_found`.
    */
   async deleteItem(kind: ItemKind, externalId: string, opts: CallOptions = {}): Promise<void> {
     const op = "deleteItem";

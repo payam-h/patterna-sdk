@@ -57,7 +57,10 @@ class ApiErrorCode:
     surface_off (409)      fallback: the kill switch
     unknown_surface (404)  fallback, but a configuration bug: alert on it
     unknown_request (404)  abandon / report_interactions named a request never logged
-    unknown_item (404)     catalog calls
+    unknown_item (422)     report_interactions named an item that was not in the slate served for
+                           that request (details["unknown_item_ids"])
+    item_not_found (404)   a catalog call (get_item, delete_item, set_item_status, set_item_tags)
+                           named an item that does not exist for that id and kind
     pii_rejected (422)     re-raised: personal data in the request
     mode_conflict (422)    re-raised: the consent mode contradicts the stored one
     mode_required (422)    set_user_profile without a mode for a user Patterna has no row for: a
@@ -71,6 +74,7 @@ class ApiErrorCode:
     UNKNOWN_SURFACE = "unknown_surface"
     UNKNOWN_REQUEST = "unknown_request"
     UNKNOWN_ITEM = "unknown_item"
+    ITEM_NOT_FOUND = "item_not_found"
     PII_REJECTED = "pii_rejected"
     MODE_CONFLICT = "mode_conflict"
     MODE_REQUIRED = "mode_required"

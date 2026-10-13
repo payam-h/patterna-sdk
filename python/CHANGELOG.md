@@ -1,10 +1,26 @@
 # Changelog: patterna-sdk (Python)
 
-Current release: 0.4.0. Not on PyPI (by decision); install from the public repository:
-`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"`.
+Current release: 0.4.1. Not on PyPI (by decision); install from the public repository:
+`pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.1#subdirectory=python"`.
 The production engine reports `engine_version: 0.3.1` (the contract version) and every key below is
 live on it; SDK 0.2 to 0.4 work against engine 0.2 or later, and older engines ignore the keys they
 do not know.
+
+## 0.4.1 (2026-10-13)
+
+No wire changes: nothing the SDK sends is different, and 0.4.0 keeps working. Compatible.
+
+### Added
+
+- `get_item(kind, external_id)`: `GET /catalog/items/{id}?kind=` under the ingest key, returning
+  the stored item dict with `attributes`, `tags` (with `source`), `status` and `enrichment`.
+- `ApiErrorCode.ITEM_NOT_FOUND` (`item_not_found`, 404) for the catalog calls (`get_item`,
+  `delete_item`, `set_item_status`, `set_item_tags`).
+
+### Fixed
+
+- `unknown_item` is the 422 from `report_interactions` (an item that was not in the slate,
+  `details["unknown_item_ids"]`), not the catalog 404; the docstring said the opposite.
 
 ## 0.4.0 (2026-10-13)
 

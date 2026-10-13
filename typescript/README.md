@@ -1,17 +1,17 @@
 # patterna-sdk
 
-Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+Version 0.4.1 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
 version), and every field in this release is live on it. Works against engine 0.2 or later;
 older engines ignore the fields they do not know.
 
 **Install.** The npm package is `patterna-sdk` (unscoped); pin the version:
 
 ```sh
-npm install patterna-sdk@0.4.0
+npm install patterna-sdk@0.4.1
 ```
 
 The source is the public repository [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk),
-directory `typescript/`, tag `v0.4.0`.
+directory `typescript/`, tag `v0.4.1`.
 
 TypeScript client for the Patterna API. One package for three places:
 
@@ -69,7 +69,7 @@ const patterna = new PatternaClient({
 | `deleteUser(userId)` | admin key if set, else ingest | 5 s | once |
 | `recommendWithFallback(req, fallback)`, `recommendMany(reqs)` | serve | 150 ms | never |
 | `abandon(requestId, reason)` | serve | 5 s | once |
-| `deleteItem`, `listItems`, `itemsChangedSince` | ingest | 5 s | once |
+| `getItem`, `deleteItem`, `listItems`, `itemsChangedSince` | ingest | 5 s | once |
 | `createSigningSecret` and the admin methods below | admin | 30 s | idempotent ones once |
 
 Budgets are per attempt and can be changed per client (`timeouts: { recommendMs, ingestMs,
@@ -269,9 +269,13 @@ await patterna.reportInteractions(s.request_id, report);
 ### Catalog reconciliation
 
 ```ts
+const item = await patterna.getItem("product", "42"); // ingest key; item.attributes, item.tags, item.status, item.enrichment
 for await (const item of patterna.itemsChangedSince(lastRun)) reconcile(item);
 await patterna.deleteItem("community", "community_42");
 ```
+
+A missing item, or one stored under another kind, rejects with `item_not_found`
+(`isApiError(err, ApiErrorCode.ItemNotFound)`); an archived one comes back with `status: "archived"`.
 
 ### Admin (admin key)
 
@@ -317,7 +321,8 @@ Every failure is a `PatternaError` with `code`, `op`, `status`, `requestId`, `de
 | `not_shown` | 409 | `abandon` on a `shown: false` slate: hide the block instead |
 | `pii_rejected` | 422 | rethrown |
 | `unknown_request` | 404 | `abandon`, `reportInteractions` |
-| `unknown_item` | 404 | catalog calls |
+| `unknown_item` | 422 | `reportInteractions`: an item that was not in the slate served for that request (`details.unknown_item_ids`) |
+| `item_not_found` | 404 | `getItem`, `deleteItem`, `setItemStatus`, `setItemTags`: no item with that id and kind |
 
 ```ts
 try {

@@ -1,6 +1,6 @@
 # patterna-sdk (Python)
 
-Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+Version 0.4.1 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
 version), and every field in this release is live on it. Works against engine 0.2 or later;
 older engines ignore the fields they do not know.
 
@@ -9,10 +9,10 @@ Go SDK: serve, ingest and admin calls, a consent gate, typed errors, one retry o
 calls, client-minted request ids with abandonment, and event signatures and assignment units that
 share test vectors across the three SDKs. No dependencies: `urllib` and `hmac` only. Python 3.10+.
 
-Not on PyPI (by decision). Install it from the public repository at tag `v0.4.0`:
+Not on PyPI (by decision). Install it from the public repository at tag `v0.4.1`:
 
 ```sh
-pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.0#subdirectory=python"
+pip install "patterna-sdk @ git+https://github.com/payam-h/patterna-sdk@v0.4.1#subdirectory=python"
 ```
 
 ```python
@@ -51,7 +51,7 @@ patterna.close()  # on shutdown: waits for background abandonments
 | `report_interactions(request_id, interactions)` | serve | 5 s | once |
 | `ingest_events(events, sign=)` | ingest | 5 s | once |
 | `upsert_items(items)`, `set_item_status(item_id, status, kind=)`, `set_item_tags(item_id, tags, kind=)` | ingest | 5 s | once |
-| `delete_item(external_id, kind=)`, `list_items(changed_since=)`, `items_changed_since(since)` | ingest | 5 s | once |
+| `get_item(kind, external_id)`, `delete_item(external_id, kind=)`, `list_items(changed_since=)`, `items_changed_since(since)` | ingest | 5 s | once |
 | `set_user_mode`, `set_user_profile`, `delete_user` | admin if set, else ingest | 5 s | once |
 | `create_signing_secret` and the admin methods below | admin | 30 s | idempotent ones once |
 
@@ -70,8 +70,12 @@ patterna.close()  # on shutdown: waits for background abandonments
   `details` and `.transient`. `ApiErrorCode` and `is_api_error(err, code)`:
   `no_candidates` (422), `surface_off` (409) and `unknown_surface` (404) fall back (alert on
   the last, it is a configuration bug); `pii_rejected` and `mode_conflict` (422) are raised by
-  the fallback helpers, as are `ConsentError` and `ValidationError`; `unknown_request` and
-  `unknown_item` (404) come from `abandon`, `report_interactions` and catalog calls.
+  the fallback helpers, as are `ConsentError` and `ValidationError`; `unknown_request` (404) comes
+  from `abandon` and `report_interactions`, `unknown_item` (422) from `report_interactions` for an
+  item that was not in the slate, and `item_not_found` (404) from the catalog calls (`get_item`,
+  `delete_item`, `set_item_status`, `set_item_tags`) for an id that does not exist under that kind.
+  `get_item(kind, external_id)` returns the stored item with `attributes`, `tags`, `status` and
+  `enrichment`.
 - **Consent.** `recommend` raises `ConsentError` unless `mode` is `personalized`, `cohort` or
   `non_profiled`; user ids must be opaque (no email, no spaces). `measured_context(context,
   analytics_consent)` sets `measured`: `False` keeps the request out of the ledger

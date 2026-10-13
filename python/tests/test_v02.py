@@ -295,15 +295,71 @@ def test_catalog_delete_and_changed_since() -> None:
     )
     assert "cursor=c2" in t.calls[1]["url"]
 
-    c, t = make(always(404, {"code": "unknown_item"}))
+    c, t = make(always(404, {"code": "item_not_found"}))
     with pytest.raises(ValidationError):
         c.delete_item("x", kind="thing")
     with pytest.raises(ApiError) as e:
         c.delete_item("c/1", kind="community")
-    assert e.value.code == ApiErrorCode.UNKNOWN_ITEM
+    assert e.value.code == ApiErrorCode.ITEM_NOT_FOUND
+    assert not is_api_error(e.value, ApiErrorCode.UNKNOWN_ITEM)
     assert t.calls[0]["method"] == "DELETE"
     assert t.calls[0]["url"] == "https://api.example/v1/catalog/items/c%2F1?kind=community"
     assert t.calls[0]["headers"]["Authorization"] == "Bearer pk_i"
+
+
+ITEM_42 = {
+    "external_id": "42",
+    "kind": "product",
+    "title": "Magnesium",
+    "locale": "nl",
+    "status": "published",
+    "premium": False,
+    "updated_at": "2026-10-13T08:00:00Z",
+    "attributes": {"price_cents": 1995, "currency": "EUR", "available": True, "format": "product"},
+    "tags": [{"tag": "sleep", "weight": 0.8, "source": "enrich", "approved": True}],
+    "enrichment": {"status": "done", "model": "claude-haiku-5-5", "updated_at": "2026-10-13T08:00:00Z"},
+}
+
+
+def test_get_item_reads_one_item_under_the_ingest_key() -> None:
+    c, t = make(always(200, ITEM_42))
+    item = c.get_item("product", "42")
+    assert item == ITEM_42
+    assert item["attributes"]["available"] is True
+    assert item["tags"][0]["source"] == "enrich"
+    assert item["enrichment"]["status"] == "done"
+    assert t.calls[0]["method"] == "GET"
+    assert t.calls[0]["url"] == "https://api.example/v1/catalog/items/42?kind=product"
+    assert t.calls[0]["headers"]["Authorization"] == "Bearer pk_i"
+    assert "X-Deadline-Ms" not in t.calls[0]["headers"]
+    # the id is path-escaped; bad input never reaches the wire
+    c.get_item("community", "c/1")
+    assert t.calls[1]["url"] == "https://api.example/v1/catalog/items/c%2F1?kind=community"
+    with pytest.raises(ValidationError):
+        c.get_item("thing", "x")
+    with pytest.raises(ValidationError):
+        c.get_item("product", "")
+    assert len(t.calls) == 2
+
+
+def test_get_item_not_found_and_retry() -> None:
+    c, t = make(always(404, {"code": "item_not_found", "message": "no item with that id and kind"}))
+    with pytest.raises(ApiError) as e:
+        c.get_item("product", "gone")
+    assert e.value.code == ApiErrorCode.ITEM_NOT_FOUND
+    assert e.value.status == 404
+    assert e.value.op == "get_item"
+    assert is_api_error(e.value, ApiErrorCode.ITEM_NOT_FOUND)
+    assert not is_api_error(e.value, ApiErrorCode.UNKNOWN_ITEM)
+    assert len(t.calls) == 1  # a 404 is not retried
+
+    replies = iter([(503, {"code": "unavailable"}), (200, {**ITEM_42, "status": "archived"}), (200, {"ok": True})])
+    c, t = make(lambda url, b: next(replies))
+    assert c.get_item("product", "42")["status"] == "archived"
+    assert len(t.calls) == 2  # one retry on 5xx
+    with pytest.raises(PatternaError) as e2:
+        c.get_item("product", "42")
+    assert e2.value.code == "bad_response"
 
 
 CFG_A = {

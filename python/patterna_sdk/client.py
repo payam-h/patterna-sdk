@@ -347,7 +347,7 @@ class PatternaClient:
         trace_id: Callable[[], str | None] | None = None,
         on_background_error: Callable[[PatternaError], None] | None = None,
         slate_memory: int = 4096,
-        user_agent: str = "patterna-sdk-python/0.4.0",
+        user_agent: str = "patterna-sdk-python/0.4.1",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.keys = {"serve": serve_key, "ingest": ingest_key, "admin": admin_key}
@@ -691,8 +691,33 @@ class PatternaClient:
             timeout_ms or self.ingest_timeout_ms,
         )
 
+    def get_item(self, kind: str, external_id: str, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        """Read one catalog item by kind and external id (GET /catalog/items/{id}?kind=, ingest key).
+
+        The answer is the item as the engine stores it: ``title``, ``status`` (``published`` or
+        ``archived``; check it when you hydrate a card), ``attributes``, ``tags`` (each with ``source``)
+        and ``enrichment`` (``{"status": ..., "model": ..., "updated_at": ...}``). ``kind`` is required
+        because one external id may exist under several kinds. A missing item, or one stored under
+        another kind, raises ApiError with code ``item_not_found`` (404).
+        """
+        if not external_id:
+            raise _invalid("get_item", "external_id is required")
+        if kind not in _ITEM_KINDS:
+            raise _invalid("get_item", f"unknown kind {kind!r}")
+        item = self._call(
+            "get_item",
+            "GET",
+            f"/catalog/items/{quote(external_id, safe='')}?kind={quote(kind, safe='')}",
+            None,
+            "ingest",
+            timeout_ms or self.ingest_timeout_ms,
+        )
+        if not isinstance(item.get("external_id"), str):
+            raise PatternaError("get_item: item without external_id", op="get_item", code="bad_response")
+        return item
+
     def delete_item(self, external_id: str, *, kind: str, timeout_ms: int | None = None) -> dict[str, Any]:
-        """Remove an item for good (engine 0.2). A missing item raises ApiError unknown_item."""
+        """Remove an item for good (engine 0.2). A missing item raises ApiError item_not_found."""
         if not external_id:
             raise _invalid("delete_item", "external_id is required")
         if kind not in _ITEM_KINDS:

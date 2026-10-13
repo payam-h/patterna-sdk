@@ -28,7 +28,10 @@ const (
 //	surface_off      409  fallback: the surface's kill switch is on; show your own list
 //	unknown_surface  404  fallback, but it is a configuration bug: alert on Recommendation.Cause
 //	unknown_request  404  Abandon or ReportInteractions named a request the engine never logged
-//	unknown_item     404  a catalog call named an item that does not exist
+//	unknown_item     422  ReportInteractions named an item that was not in the slate served for
+//	                      that request (Details["unknown_item_ids"] lists them)
+//	item_not_found   404  a catalog call (GetItem, DeleteItem, SetItemStatus, SetItemTags) named an
+//	                      item that does not exist for that id and kind
 //	pii_rejected     422  returned, never a fallback: the request carried personal data
 //	mode_conflict    422  returned, never a fallback: the consent mode contradicts the stored one
 //	mode_required    422  SetUserProfile without Mode for a user Patterna has no row for: a profile
@@ -40,6 +43,7 @@ const (
 	CodeUnknownSurface = "unknown_surface"
 	CodeUnknownRequest = "unknown_request"
 	CodeUnknownItem    = "unknown_item"
+	CodeItemNotFound   = "item_not_found"
 	CodePIIRejected    = "pii_rejected"
 	CodeModeConflict   = "mode_conflict"
 	CodeModeRequired   = "mode_required"
@@ -78,6 +82,7 @@ var (
 	ErrUnknownSurface = &Error{Code: CodeUnknownSurface}
 	ErrUnknownRequest = &Error{Code: CodeUnknownRequest}
 	ErrUnknownItem    = &Error{Code: CodeUnknownItem}
+	ErrItemNotFound   = &Error{Code: CodeItemNotFound}
 	ErrPIIRejected    = &Error{Code: CodePIIRejected}
 	ErrModeConflict   = &Error{Code: CodeModeConflict}
 	ErrModeRequired   = &Error{Code: CodeModeRequired}

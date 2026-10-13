@@ -8,9 +8,34 @@ import (
 	"time"
 )
 
+// GetItem reads one catalog item by external id and kind (GET /v1/catalog/items/{external_id}?kind=,
+// ingest key): title, status, attributes, tags with their source, and the enrichment state. kind is
+// required because the same external id may exist under several kinds. An item that does not
+// exist, or exists under another kind, answers ErrItemNotFound (404 item_not_found); an archived
+// item is returned with Status StatusArchived, so check it when you hydrate a card.
+func (c *Client) GetItem(ctx context.Context, kind ItemKind, externalID string, opts ...CallOption) (*Item, error) {
+	const op = "getItem"
+	if externalID == "" {
+		return nil, newError(CodeInvalidArgument, op, "external id is required")
+	}
+	if !kind.Valid() {
+		return nil, newError(CodeInvalidArgument, op, "unknown kind %q", string(kind))
+	}
+	var out Item
+	err := c.do(ctx, call{
+		op: op, method: http.MethodGet, path: "/catalog/items/" + url.PathEscape(externalID),
+		query: url.Values{"kind": {string(kind)}},
+		scope: scopeIngest, timeout: c.cfg.IngestTimeout, idempotent: true, opts: collect(opts),
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // DeleteItem removes an item from the catalog for good (engine 0.2:
 // DELETE /v1/catalog/items/{external_id}?kind=). Archive with SetItemStatus when you may want it
-// back. Deleting an item that does not exist answers ErrUnknownItem.
+// back. Deleting an item that does not exist answers ErrItemNotFound.
 func (c *Client) DeleteItem(ctx context.Context, kind ItemKind, externalID string, opts ...CallOption) error {
 	const op = "deleteItem"
 	if externalID == "" {

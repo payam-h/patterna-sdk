@@ -2,9 +2,27 @@
 
 Module `github.com/payam-h/patterna-sdk/go`. Tags are `go/vX.Y.Z` in
 [payam-h/patterna-sdk](https://github.com/payam-h/patterna-sdk); install with
-`go get github.com/payam-h/patterna-sdk/go@v0.4.0`. Current release: 0.4.0. The production engine
+`go get github.com/payam-h/patterna-sdk/go@v0.4.1`. Current release: 0.4.1. The production engine
 reports `engine_version: 0.3.1` (the contract version) and every field below is live on it; SDK 0.2
 to 0.4 work against engine 0.2 or later, and older engines ignore the fields they do not know.
+
+## 0.4.1 (2026-10-13)
+
+No wire changes: nothing the SDK sends is different, and 0.4.0 keeps working. Source-compatible.
+
+### Added
+
+- `GetItem(ctx, kind, externalID)`: `GET /catalog/items/{external_id}?kind=` under the ingest
+  key, returning the stored `Item` with `Attributes`, `Tags` (now with `Source`), `Status`,
+  `Locales`, `Region` and the new `Enrichment` (`ItemEnrichment`: status, model, updated_at).
+- `ErrItemNotFound` / `CodeItemNotFound` for the catalog 404 `item_not_found` (`GetItem`,
+  `DeleteItem`, `SetItemStatus`, `SetItemTags`).
+
+### Fixed
+
+- `ErrUnknownItem` is the 422 `unknown_item` from `ReportInteractions` (an item that was not in
+  the slate), not the catalog 404; the comments in `errors.go` and the README error table said the
+  opposite. `DeleteItem`'s doc names the right code.
 
 ## 0.4.0 (2026-10-13)
 

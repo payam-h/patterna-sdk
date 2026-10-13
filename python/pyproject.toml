@@ -1,6 +1,6 @@
 [project]
 name = "patterna-sdk"
-version = "0.4.0"
+version = "0.4.1"
 description = "Python client for the Patterna recommendation API: serve, ingest, signed events, consent gate."
 readme = "README.md"
 requires-python = ">=3.10"

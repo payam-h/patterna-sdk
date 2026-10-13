@@ -308,6 +308,9 @@ type ItemTag struct {
 	Tag      string   `json:"tag"`
 	Weight   *float64 `json:"weight,omitempty"`
 	Approved *bool    `json:"approved,omitempty"`
+	// Source is set on tags the engine returns (GetItem, ListItems): "editor", "import" or
+	// "enrich". It is ignored on the way in.
+	Source string `json:"source,omitempty"`
 }
 
 // UpsertItemsResult is the answer to UpsertItems.
@@ -329,6 +332,19 @@ type Item struct {
 	UpdatedAt   *time.Time     `json:"updated_at,omitempty"` // engine 0.2
 	Attributes  map[string]any `json:"attributes,omitempty"`
 	Tags        []ItemTag      `json:"tags,omitempty"`
+	// Locales and Region are the item's eligibility as the engine stores it (GetItem, ListItems).
+	Locales []string `json:"locales,omitempty"`
+	Region  *string  `json:"region,omitempty"`
+	// Enrichment is the state of the LLM tagging job for this item; GetItem fills it.
+	Enrichment *ItemEnrichment `json:"enrichment,omitempty"`
+}
+
+// ItemEnrichment says where the enrich job stands for an item: Status is pending, done, failed
+// or skipped; Model names the model that tagged it when known.
+type ItemEnrichment struct {
+	Status    string     `json:"status"`
+	Model     string     `json:"model,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // ItemPage is one page of ListItems.

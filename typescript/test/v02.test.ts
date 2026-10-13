@@ -301,12 +301,65 @@ describe("catalog", () => {
     expect(m.calls[1]!.url).toContain("cursor=c2");
   });
 
-  it("deleteItem refuses unknown kinds and passes unknown_item through", async () => {
-    const m = mockFetch({ status: 404, body: { code: "unknown_item" } });
+  it("deleteItem refuses unknown kinds and passes item_not_found through", async () => {
+    const m = mockFetch({ status: 404, body: { code: "item_not_found" } });
     const c = client(m.fetch);
     await expect(c.deleteItem("thing" as "document", "x")).rejects.toBeInstanceOf(ValidationError);
     const err = await c.deleteItem("document", "x").catch((e: unknown) => e);
-    expect(isApiError(err, ApiErrorCode.UnknownItem)).toBe(true);
+    expect(isApiError(err, ApiErrorCode.ItemNotFound)).toBe(true);
+    expect(isApiError(err, ApiErrorCode.UnknownItem)).toBe(false);
+  });
+
+  it("getItem reads one item with attributes, tags and enrichment under the ingest key", async () => {
+    const item = {
+      external_id: "42",
+      kind: "product",
+      title: "Magnesium",
+      locale: "nl",
+      status: "published",
+      premium: false,
+      updated_at: "2026-10-13T08:00:00Z",
+      attributes: { price_cents: 1995, currency: "EUR", available: true, format: "product" },
+      tags: [{ tag: "sleep", weight: 0.8, source: "enrich", approved: true }],
+      enrichment: { status: "done", model: "claude-haiku-5-5", updated_at: "2026-10-13T08:00:00Z" },
+    };
+    const m = mockFetch({ status: 200, body: item });
+    const got = await client(m.fetch).getItem("product", "42");
+    expect(got).toEqual(item);
+    expect(got.attributes?.available).toBe(true);
+    expect(got.enrichment?.status).toBe("done");
+    expect(m.calls[0]).toMatchObject({ method: "GET", url: `${BASE}/catalog/items/42?kind=product` });
+    expect(m.calls[0]!.headers.authorization).toBe(`Bearer ${KEYS.ingest}`);
+    expect(m.calls[0]!.headers["x-deadline-ms"]).toBeUndefined();
+  });
+
+  it("getItem escapes the id, refuses bad input before the wire, and surfaces item_not_found", async () => {
+    const m = mockFetch(
+      { status: 200, body: { external_id: "c/1", kind: "community", title: "x", locale: "nl", status: "published" } },
+      { status: 404, body: { code: "item_not_found", message: "no item with that id and kind" }, headers: { "x-request-id": "req_404" } },
+    );
+    const c = client(m.fetch);
+    await c.getItem("community", "c/1");
+    expect(m.calls[0]!.url).toBe(`${BASE}/catalog/items/c%2F1?kind=community`);
+    await expect(c.getItem("thing" as "document", "x")).rejects.toBeInstanceOf(ValidationError);
+    await expect(c.getItem("product", "")).rejects.toBeInstanceOf(ValidationError);
+    expect(m.calls).toHaveLength(1);
+    const err = await c.getItem("product", "gone").catch((e: unknown) => e);
+    expect(isApiError(err, ApiErrorCode.ItemNotFound)).toBe(true);
+    expect(err).toMatchObject({ op: "getItem", status: 404, requestId: "req_404" });
+    expect(isApiError(err, ApiErrorCode.UnknownItem)).toBe(false);
+  });
+
+  it("getItem retries once on a 5xx and rejects a body without external_id", async () => {
+    const m = mockFetch(
+      { status: 503, body: { code: "unavailable" } },
+      { status: 200, body: { external_id: "42", kind: "product", title: "x", locale: "nl", status: "archived" } },
+      { status: 200, body: { ok: true } },
+    );
+    const c = client(m.fetch);
+    expect((await c.getItem("product", "42")).status).toBe("archived");
+    expect(m.calls).toHaveLength(2);
+    await expect(c.getItem("product", "42")).rejects.toMatchObject({ code: "bad_response", op: "getItem" });
   });
 });
 

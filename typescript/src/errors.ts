@@ -34,7 +34,8 @@ export type SdkErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
  * | `surface_off` | 409 | fallback: the kill switch |
  * | `unknown_surface` | 404 | fallback, but a configuration bug: alert on it |
  * | `unknown_request` | 404 | `abandon` / `reportInteractions` named a request never logged |
- * | `unknown_item` | 404 | catalog calls |
+ * | `unknown_item` | 422 | `reportInteractions` named an item that was not in the slate served for that request (`details.unknown_item_ids`) |
+ * | `item_not_found` | 404 | a catalog call (`getItem`, `deleteItem`, `setItemStatus`, `setItemTags`) named an item that does not exist for that id and kind |
  * | `pii_rejected` | 422 | rethrown: personal data in the request |
  * | `mode_conflict` | 422 | rethrown: the consent mode contradicts the stored one |
  * | `mode_required` | 422 | `setUserProfile` without `mode` for a user Patterna has no row for (engine 0.3) |
@@ -46,6 +47,7 @@ export const ApiErrorCode = {
   UnknownSurface: "unknown_surface",
   UnknownRequest: "unknown_request",
   UnknownItem: "unknown_item",
+  ItemNotFound: "item_not_found",
   PiiRejected: "pii_rejected",
   ModeConflict: "mode_conflict",
   ModeRequired: "mode_required",

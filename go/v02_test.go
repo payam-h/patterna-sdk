@@ -411,9 +411,86 @@ func TestCatalogAndAdminHelpers(t *testing.T) {
 		}
 	})
 	t.Run("DeleteItem unknown", func(t *testing.T) {
-		r := newRecorder(t, reply{status: 404, body: `{"code":"unknown_item"}`})
-		if err := r.client(t).DeleteItem(t.Context(), KindDocument, "x"); !errors.Is(err, ErrUnknownItem) {
+		r := newRecorder(t, reply{status: 404, body: `{"code":"item_not_found"}`})
+		err := r.client(t).DeleteItem(t.Context(), KindDocument, "x")
+		if !errors.Is(err, ErrItemNotFound) || !IsAPIError(err, "item_not_found") {
 			t.Errorf("err = %v", err)
+		}
+		if errors.Is(err, ErrUnknownItem) {
+			t.Errorf("item_not_found matched ErrUnknownItem (422 from /interactions)")
+		}
+	})
+	t.Run("GetItem", func(t *testing.T) {
+		r := newRecorder(t, reply{status: 200, requestID: "req_g", body: `{"external_id":"42","kind":"product","title":"Magnesium","locale":"nl",
+			"status":"published","premium":false,"updated_at":"2026-10-13T08:00:00Z",
+			"attributes":{"price_cents":1995,"currency":"EUR","available":true,"format":"product"},
+			"tags":[{"tag":"sleep","weight":0.8,"source":"enrich","approved":true}],
+			"enrichment":{"status":"done","model":"claude-haiku-5-5","updated_at":"2026-10-13T08:00:00Z"}}`})
+		it, err := r.client(t).GetItem(t.Context(), KindProduct, "42")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := r.requests()[0]
+		if got.Method != "GET" || got.Path != "/v1/catalog/items/42" || got.Query != "kind=product" || got.Auth != "Bearer "+testIngestKey {
+			t.Errorf("got %+v", got)
+		}
+		if it.ExternalID != "42" || it.Kind != KindProduct || it.Title != "Magnesium" || it.Status != StatusPublished {
+			t.Errorf("item = %+v", it)
+		}
+		if v, _ := it.Attributes["price_cents"].(float64); v != 1995 || it.Attributes["available"] != true {
+			t.Errorf("attributes = %v", it.Attributes)
+		}
+		if len(it.Tags) != 1 || it.Tags[0].Tag != "sleep" || it.Tags[0].Source != "enrich" || it.Tags[0].Weight == nil || *it.Tags[0].Weight != 0.8 {
+			t.Errorf("tags = %+v", it.Tags)
+		}
+		if it.Enrichment == nil || it.Enrichment.Status != "done" || it.Enrichment.Model != "claude-haiku-5-5" || it.Enrichment.UpdatedAt == nil {
+			t.Errorf("enrichment = %+v", it.Enrichment)
+		}
+		if it.UpdatedAt == nil || it.UpdatedAt.Format(time.RFC3339) != "2026-10-13T08:00:00Z" {
+			t.Errorf("updated_at = %v", it.UpdatedAt)
+		}
+	})
+	t.Run("GetItem escapes the id and refuses bad input", func(t *testing.T) {
+		r := newRecorder(t, reply{status: 200, body: `{"external_id":"c/1","kind":"community","title":"x","locale":"nl","status":"published"}`})
+		if _, err := r.client(t).GetItem(t.Context(), KindCommunity, "c/1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.requests()[0]; got.Path != "/v1/catalog/items/c%2F1" || got.Query != "kind=community" {
+			t.Errorf("got %+v", got)
+		}
+		if _, err := r.client(t).GetItem(t.Context(), "thing", "x"); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("kind: err = %v", err)
+		}
+		if _, err := r.client(t).GetItem(t.Context(), KindProduct, ""); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("id: err = %v", err)
+		}
+		if len(r.requests()) != 1 {
+			t.Errorf("invalid input reached the wire: %d requests", len(r.requests()))
+		}
+	})
+	t.Run("GetItem not found", func(t *testing.T) {
+		r := newRecorder(t, reply{status: 404, requestID: "req_404", body: `{"code":"item_not_found","message":"no item with that id and kind"}`})
+		it, err := r.client(t).GetItem(t.Context(), KindProduct, "gone")
+		if it != nil || !errors.Is(err, ErrItemNotFound) {
+			t.Fatalf("it = %v, err = %v", it, err)
+		}
+		var pe *Error
+		if !errors.As(err, &pe) || pe.Status != 404 || pe.Op != "getItem" || pe.RequestID != "req_404" {
+			t.Errorf("err = %+v", pe)
+		}
+		if errors.Is(err, ErrUnknownItem) {
+			t.Errorf("item_not_found matched ErrUnknownItem")
+		}
+	})
+	t.Run("GetItem retries once on 5xx", func(t *testing.T) {
+		r := newRecorder(t, reply{status: 503, body: `{"code":"unavailable"}`},
+			reply{status: 200, body: `{"external_id":"42","kind":"product","title":"x","locale":"nl","status":"archived"}`})
+		it, err := r.client(t).GetItem(t.Context(), KindProduct, "42")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if it.Status != StatusArchived || len(r.requests()) != 2 {
+			t.Errorf("status = %s, requests = %d", it.Status, len(r.requests()))
 		}
 	})
 	t.Run("ItemsChangedSince pages through", func(t *testing.T) {

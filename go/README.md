@@ -1,11 +1,11 @@
 # sdk-go: `github.com/payam-h/patterna-sdk/go`
 
-Version 0.4.0 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
+Version 0.4.1 (see `CHANGELOG.md`): the production engine reports `engine_version: 0.3.1` on `GET /v1/health` (the contract
 version), and every field in this release is live on it. Works against engine 0.2 or later;
 older engines ignore the fields they do not know.
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.4.0   # tag go/v0.4.0 in payam-h/patterna-sdk
+go get github.com/payam-h/patterna-sdk/go@v0.4.1   # tag go/v0.4.1 in payam-h/patterna-sdk
 ```
 
 Go client for the Patterna API, built for a customer backend in a request path (the Gin + gqlgen
@@ -27,7 +27,7 @@ go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
 | `options.go` | `CallOption` (`WithTester`, `WithTraceID`, `WithRequestID`), trace ids, `NewRequestID` |
 | `abandon.go` | `Abandon`, `AbandonSync` |
 | `many.go` | `RecommendMany` |
-| `catalog.go` | `DeleteItem`, `ListItems`, `ItemsChangedSince`, `CreateSigningSecret`, `AdminCall` |
+| `catalog.go` | `GetItem`, `DeleteItem`, `ListItems`, `ItemsChangedSince`, `CreateSigningSecret`, `AdminCall` |
 | `assignment.go` | `AssignmentUnit` |
 | `slatekinds.go` | memory of recent slates' item kinds, for the interaction `kind` check |
 | `breaker.go` | consecutive-failure circuit breaker, one per scope |
@@ -81,7 +81,7 @@ if rec.Slate != nil {
 | `SetUserMode`, `SetUserProfile`, `DeleteUser` | admin if set, else ingest | 5 s | once |
 | `RecommendMany` | serve | 150 ms for all | never |
 | `Abandon` (async), `AbandonSync` | serve (ingest breaker) | 5 s | once |
-| `DeleteItem`, `ListItems`, `ItemsChangedSince` | ingest | 5 s per page | once |
+| `GetItem`, `DeleteItem`, `ListItems`, `ItemsChangedSince` | ingest | 5 s per page | once |
 | `CreateSigningSecret`, `AdminCall`, `admin.*` | admin | 30 s | idempotent ones once |
 
 - **Deadlines.** Each call runs under `context.WithTimeout(ctx, budget)`; a shorter caller
@@ -152,7 +152,8 @@ if rec.Slate != nil {
   | `ErrNotShown` | 409 | `Abandon`, `AbandonSync`: the slate was answered `shown: false`; hide the block, never abandon it |
   | `ErrPIIRejected` | 422 | **returned**: personal data in the request |
   | `ErrUnknownRequest` | 404 | `AbandonSync`, `ReportInteractionsSync`: the engine never logged that id |
-  | `ErrUnknownItem` | 422 | `ReportInteractionsSync`: an item id that was not in the slate (API code `unknown_item`). Catalog calls answer 404 `item_not_found`, a plain `*Error`: test it with `IsAPIError(err, "item_not_found")` |
+  | `ErrUnknownItem` | 422 | `ReportInteractionsSync`: an item id that was not in the slate served for that request (API code `unknown_item`, `Details["unknown_item_ids"]`) |
+  | `ErrItemNotFound` | 404 | `GetItem`, `DeleteItem`, `SetItemStatus`, `SetItemTags`: no item with that id and kind (API code `item_not_found`) |
   | `ErrConsentRequired`, `ErrConsentViolation`, `ErrInvalidArgument`, `ErrNotConfigured` | - | **returned**, nothing sent |
   | `ErrTimeout`, `ErrNetwork`, `ErrCircuitOpen`, other 5xx | - | fallback |
 
@@ -324,7 +325,9 @@ gives one ranked list and one ledger row, which you cannot split into two proofs
 ## Catalog reconciliation and the signing secret
 
 ```go
-err := pc.ItemsChangedSince(ctx, lastRun, "", func(it patterna.Item) error { return reconcile(it) })
+it, err := pc.GetItem(ctx, patterna.KindProduct, "42") // ingest key; it.Attributes, it.Tags, it.Status, it.Enrichment
+if errors.Is(err, patterna.ErrItemNotFound) { /* never synced, or another kind */ }
+err = pc.ItemsChangedSince(ctx, lastRun, "", func(it patterna.Item) error { return reconcile(it) })
 err = pc.DeleteItem(ctx, patterna.KindCommunity, "community_42") // archive with SetItemStatus instead if it may return
 secret, err := pc.CreateSigningSecret(ctx)                       // admin key, shown once
 signed, err := patterna.SignEvent(ev, secret.SigningSecret)        // the string as returned, never hex-decoded
@@ -348,7 +351,7 @@ surface calls read it back, so they return the surface after the change.
 The CLI keeps flow configs in your repository and applies them in CI:
 
 ```sh
-go install github.com/payam-h/patterna-sdk/go/cmd/patterna@v0.4.0   # the module tag is go/v0.4.0; go resolves it from @v0.4.0
+go install github.com/payam-h/patterna-sdk/go/cmd/patterna@v0.4.1   # the module tag is go/v0.4.1; go resolves it from @v0.4.1
 export PATTERNA_URL=https://patterna-api.orven.am/v1 PATTERNA_ADMIN_KEY=...   # CI secret, never a flag
 
 patterna flow get --surface more_to_read > patterna/flows/more_to_read.json  # once, to start
@@ -399,7 +402,7 @@ tagged `v<version>` and `go/v<version>` (the Go module tag for a module in a sub
 version, never `latest`:
 
 ```sh
-go get github.com/payam-h/patterna-sdk/go@v0.4.0
+go get github.com/payam-h/patterna-sdk/go@v0.4.1
 ```
 
 `CHANGELOG.md` lists every release. A v2 would need `/v2` at the end of the module path.
